@@ -132,10 +132,15 @@ class Aurora(torch.nn.Module):
                 f"Please ensure that this is right!",
                 stacklevel=2,
             )
-
-        # warn if the user is not normalising batches outside of the model
-        # note that British English is used throughout the repo so we are being consistent in our mods
-        if not self.normalise:
+        if self.normalise:
+            # note that British English is used throughout the repo so we are being consistent in our mods
+            warnings.warn(
+                "The model is normalising batches. If you do not want this to occur, set normalise to "
+                "False at model instantiation.",
+                stacklevel=2,
+            )
+        else: 
+            # only warning here for backwards compatibility
             warnings.warn(
                 "The model is not normalising batches because normalise is set to False at model instantiation. " \
                 "If you are not normalising outside of the model, check your model settings.",
