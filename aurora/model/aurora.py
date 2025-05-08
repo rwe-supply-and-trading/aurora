@@ -57,6 +57,7 @@ class Aurora(torch.nn.Module):
         lora_mode: LoRAMode = "single",
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
+        normalise: bool = True,
     ) -> None:
         """Construct an instance of the model.
 
@@ -112,6 +113,7 @@ class Aurora(torch.nn.Module):
                 and scale.
             autocast (bool, optional): Use `torch.autocast` to reduce memory usage. Defaults to
                 `False`.
+            normalise (bool, optional): Normalise (and un-normalise) the input data. Defaults to `True`.
         """
         super().__init__()
         self.surf_vars = surf_vars
@@ -121,8 +123,24 @@ class Aurora(torch.nn.Module):
         self.autocast = autocast
         self.max_history_size = max_history_size
         self.timestep = timestep
+        self.normalise = normalise
 
-        if self.surf_stats:
+        if self.normalise:
+            # note that British English is used throughout the repo so we are being consistent in our mods
+            warnings.warn(
+                "The model is normalising batches. If you do not want this to occur, set normalise to "
+                "False at model instantiation.",
+                stacklevel=2,
+            )
+        else: 
+            # only warning here for backwards compatibility
+            warnings.warn(
+                "The model is not normalising batches because normalise is set to False at model instantiation. " \
+                "If you are not normalising outside of the model, check your model settings.",
+                stacklevel=2,
+            )
+
+        if self.surf_stats and self.normalise:
             warnings.warn(
                 f"The normalisation statics for the following surface-level variables are manually "
                 f"adjusted: {', '.join(sorted(self.surf_stats.keys()))}. "
@@ -189,7 +207,10 @@ class Aurora(torch.nn.Module):
         # Get the first parameter. We'll derive the data type and device from this parameter.
         p = next(self.parameters())
         batch = batch.type(p.dtype)
-        batch = batch.normalise(surf_stats=self.surf_stats)
+
+        if self.normalise:
+            batch = batch.normalise(surf_stats=self.surf_stats)
+
         batch = batch.crop(patch_size=self.patch_size)
         batch = batch.to(p.device)
 
@@ -238,7 +259,8 @@ class Aurora(torch.nn.Module):
             atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
         )
 
-        pred = pred.unnormalise(surf_stats=self.surf_stats)
+        if self.normalise:
+            pred = pred.unnormalise(surf_stats=self.surf_stats)
 
         return pred
 
