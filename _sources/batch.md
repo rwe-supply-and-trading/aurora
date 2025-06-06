@@ -58,6 +58,43 @@ The following surface-level variables are allowed:
 | `10v` | Ten-meter southward wind speed in `m/s` |
 | `msl` | Mean sea-level pressure in `Pa` |
 
+For [Aurora 0.4° Air Pollution](aurora-air-pollution), the following surface-level variables are
+also allowed:
+
+| Name | Description |
+| - | - |
+| `pm1` | Particulate matter less than `1 um` in `kg/m^3` |
+| `pm2p5` | Particulate matter less than `2.5 um` in `kg/m^3` |
+| `pm10` | Particulate matter less than `10 um` in `kg/m^3` |
+| `tcco` | Total column carbon monoxide in `kg/m^2` |
+| `tc_no` | Total column nitrogen monoxide in `kg/m^2` |
+| `tcno2` | Total column nitrogen dioxide in `kg/m^2` |
+| `tcso2` | Total column sulphur dioxide in `kg/m^2` |
+| `gtco3` | Total column ozone in `kg/m^2` |
+
+For [Aurora 0.25° Wave](aurora-wave), the following surface-level variables are also allowed:
+
+| Name | Description |
+| - | - |
+| `swh` | Significant wave height of the total wave in `m` |
+| `mwd` | Mean wave direction of the total wave in `degrees` |
+| `mwp` | Mean wave period of the total wave in `s` |
+| `pp1d` | Peak wave period of the total wave in `s` |
+| `shww` | Significant wave height of the wind wave component in `m` |
+| `mdww` | Mean wave direction of the wind wave component in `degrees` |
+| `mpww` | Mean wave period of the wind wave component in `s` |
+| `shts` | Significant wave height of the total swell component in `m` |
+| `mdts` | Mean wave direction of the total swell component in `degrees` |
+| `mpts` | Mean wave period of the total swell component in `s` |
+| `swh1` | Significant wave height of the first swell component in `m` |
+| `mwd1` | Mean wave direction of the first swell component in `degrees` |
+| `mwp1` | Mean wave period of the first swell component in `s` |
+| `swh2` | Significant wave height of the second swell component in `m` |
+| `mwd2` | Mean wave direction of the second swell component in `degrees` |
+| `mwp2` | Mean wave period of the second swell component in `s` |
+| `wind` | Ten-meter neutral wind speed in `m/s` |
+| `10u_wind` | Ten-meter eastward neutral wind speed in `m/s` |
+| `10v_wind` | Ten-meter southward neutral wind speed in `m/s` |
 
 ## `Batch.static_vars`
 
@@ -72,7 +109,13 @@ The following static variables are allowed:
 | - | - |
 | `lsm` | [Land-sea mask](https://codes.ecmwf.int/grib/param-db/172) |
 | `slt` | [Soil type](https://codes.ecmwf.int/grib/param-db/43) |
-| `z` | Surface-level geopotential in `m^2 / s^2` |
+| `z` | Surface-level geopotential in `m^2/s^2` |
+
+[Aurora 0.4° Air Pollution](aurora-air-pollution)
+and [Aurora 0.25° Wave](aurora-wave) require additional static variables, but these are not
+easy to obtain yourself.
+You need to obtain these from the HuggingFace repository.
+See the description of the models.
 
 ## `Batch.atmos_vars`
 
@@ -83,15 +126,26 @@ The atmospheric variables must be of the form `(b, t, c, h, w)` where `b` is the
 and `w` the number of longitudes.
 All atmospheric variables must contain the same collection of pressure levels in the same order.
 
-The following atmospheric variables are allows:
+The following atmospheric variables are allowed:
 
 | Name | Description |
 | - | - |
 | `t` | Temperature in `K` |
 | `u` | Eastward wind speed in `m/s` |
 | `v` | Southward wind speed in `m/s` |
-| `q` | Specific humidity in `kg / kg` |
-| `z` | Geopotential in `m^2 / s^2` |
+| `q` | Specific humidity in `kg/kg` |
+| `z` | Geopotential in `m^2/s^2` |
+
+For [Aurora 0.4° Air Pollution](aurora-air-pollution), the following atmospheric variables are
+also allowed:
+
+| Name | Description |
+| - | - |
+| `co` | Carbon monoxide in `kg/kg` |
+| `no` | Nitrogen monoxide in `kg/kg` |
+| `no2` | Nitrogen dioxide in `kg/kg` |
+| `so2` | Sulphur dioxide in `kg/kg` |
+| `go3` | Ozone in `kg/kg` |
 
 ## `Batch.metadata`
 

@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 
 
-<html lang="en" data-content_root="./" >
+<html lang="en" data-content_root="./" data-theme="light">
 
   <head>
     <meta charset="utf-8" />
@@ -13,8 +13,8 @@
   
   
   <script data-cfasync="false">
-    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
-    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
   </script>
   
   <!-- Loaded before other Sphinx assets -->
@@ -60,14 +60,14 @@
     <script>DOCUMENTATION_OPTIONS.pagename = 'models';</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Beware!" href="beware.html" />
+    <link rel="next" title="Tropical Cyclone Tracking" href="tracking.html" />
     <link rel="prev" title="Form of a Batch" href="batch.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   </head>
   
   
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
 
   
   
@@ -150,8 +150,6 @@
   
     
     
-      
-    
     
     <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
     <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
@@ -184,6 +182,7 @@
 <li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
 <li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
@@ -193,7 +192,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
 <li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
-<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
 <ul class="nav bd-sidenav">
@@ -403,7 +405,7 @@ document.write(`
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#static-variables">Static Variables</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-pretrained-small">Aurora 0.25° Pretrained Small</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-small-pretrained">Aurora 0.25° Small Pretrained</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Usage</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Recommended Use</a></li>
 </ul>
@@ -415,11 +417,29 @@ document.write(`
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-1-fine-tuned">Aurora 0.1° Fine-Tuned</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-12-hour-pretrained">Aurora 0.25° 12-Hour Pretrained</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Usage</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Recommended Use</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">Static Variables</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">Notes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-1-fine-tuned">Aurora 0.1° Fine-Tuned</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id10">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id11">Static Variables</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id12">Notes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-4-air-pollution">Aurora 0.4° Air Pollution</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id13">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id14">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id15">Static Variables</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-wave">Aurora 0.25° Wave</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id16">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id17">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id18">Static Variables</a></li>
 </ul>
 </li>
 </ul>
@@ -442,10 +462,10 @@ We now describe the available models in turn.</p>
 <p>Aurora 0.25° Pretrained is a version of Aurora trained on a wide variety of data.</p>
 <section id="usage">
 <h3>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Aurora</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
 
-<span class="n">model</span> <span class="o">=</span> <span class="n">Aurora</span><span class="p">(</span><span class="n">use_lora</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># Model is not fine-tuned.</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.25-pretrained.ckpt&quot;</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -488,15 +508,15 @@ For convenience, these are also available in
 <a class="reference external" href="https://huggingface.co/microsoft/aurora/blob/main/aurora-0.25-static.pickle">the HuggingFace repository</a>.</p>
 </section>
 </section>
-<section id="aurora-0-25-pretrained-small">
-<h2>Aurora 0.25° Pretrained Small<a class="headerlink" href="#aurora-0-25-pretrained-small" title="Link to this heading">#</a></h2>
-<p>Aurora 0.25° Pretrained Small is, as the name suggests, a smaller version of Aurora 0.25° Pretrained.</p>
+<section id="aurora-0-25-small-pretrained">
+<h2>Aurora 0.25° Small Pretrained<a class="headerlink" href="#aurora-0-25-small-pretrained" title="Link to this heading">#</a></h2>
+<p>Aurora 0.25° Small Pretrained is, as the name suggests, a smaller version of Aurora 0.25° Pretrained.</p>
 <section id="id1">
 <h3>Usage<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraSmall</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraSmallPretrained</span>
 
-<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraSmall</span><span class="p">()</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.25-small-pretrained.ckpt&quot;</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraSmallPretrained</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -514,7 +534,7 @@ We do not recommend any other use.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Aurora</span>
 
 <span class="n">model</span> <span class="o">=</span> <span class="n">Aurora</span><span class="p">()</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.25-finetuned.ckpt&quot;</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -581,26 +601,73 @@ For convenience, these are also available in
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Aurora</span>
 
 <span class="n">model</span> <span class="o">=</span> <span class="n">Aurora</span><span class="p">(</span><span class="n">use_lora</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># Disable LoRA for more realistic samples.</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.25-finetuned.ckpt&quot;</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
 </section>
-<section id="aurora-0-1-fine-tuned">
-<h2>Aurora 0.1° Fine-Tuned<a class="headerlink" href="#aurora-0-1-fine-tuned" title="Link to this heading">#</a></h2>
-<p>Aurora 0.1° Fine-Tuned is a high-resolution version of Aurora.</p>
+<section id="aurora-0-25-12-hour-pretrained">
+<h2>Aurora 0.25° 12-Hour Pretrained<a class="headerlink" href="#aurora-0-25-12-hour-pretrained" title="Link to this heading">#</a></h2>
+<p>Aurora 0.25° 12-Hour Pretrained is Aurora 0.25° Pretrained with a 12-hour lead time.</p>
 <section id="id6">
 <h3>Usage<a class="headerlink" href="#id6" title="Link to this heading">#</a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraHighRes</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Aurora12hPretrained</span>
 
-<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraHighRes</span><span class="p">()</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.1-finetuned.ckpt&quot;</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">Aurora12hPretrained</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
 <section id="id7">
 <h3>Recommended Use<a class="headerlink" href="#id7" title="Link to this heading">#</a></h3>
-<p>Use Aurora 0.1° Fine-Tuned if you aim to make predictions for IFS HRES T0 at 0.1° resolution.
+<p>Use Aurora 0.25° 12-Hour Pretrained if you wish to make predictions with a 12-hour lead time.</p>
+<p>For optimal performance, the model requires the following variables and pressure levels:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Required</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Surface-level variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2t</span></code>, <code class="docutils literal notranslate"><span class="pre">10u</span></code>, <code class="docutils literal notranslate"><span class="pre">10v</span></code>, <code class="docutils literal notranslate"><span class="pre">msl</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Static variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lsm</span></code>, <code class="docutils literal notranslate"><span class="pre">slt</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Atmospheric variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">t</span></code>, <code class="docutils literal notranslate"><span class="pre">u</span></code>, <code class="docutils literal notranslate"><span class="pre">v</span></code>, <code class="docutils literal notranslate"><span class="pre">q</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Pressure levels (hPa)</p></td>
+<td><p>50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id8">
+<h3>Static Variables<a class="headerlink" href="#id8" title="Link to this heading">#</a></h3>
+<p>Aurora 0.25° 12-Hour Pretrained requires
+<a class="reference external" href="https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels?tab=form">static variables from ERA5</a>.
+For convenience, these are also available in
+<a class="reference external" href="https://huggingface.co/microsoft/aurora/blob/main/aurora-0.25-static.pickle">the HuggingFace repository</a>.</p>
+</section>
+</section>
+<section id="aurora-0-1-fine-tuned">
+<h2>Aurora 0.1° Fine-Tuned<a class="headerlink" href="#aurora-0-1-fine-tuned" title="Link to this heading">#</a></h2>
+<p>Aurora 0.1° Fine-Tuned is a high-resolution version of Aurora.</p>
+<section id="id9">
+<h3>Usage<a class="headerlink" href="#id9" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraHighRes</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraHighRes</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="id10">
+<h3>Recommended Use<a class="headerlink" href="#id10" title="Link to this heading">#</a></h3>
+<p>Use Aurora 0.1° Fine-Tuned if you aim to make predictions for IFS HRES analysis at 0.1° resolution.
 Note that 0.1° resolution means that the data should have dimensions <code class="docutils literal notranslate"><span class="pre">(1801,</span> <span class="pre">3600)</span></code>.
 Aurora 0.1° Fine-Tuned is the best performing version of Aurora at 0.1° resolution.</p>
 <p><strong>Important:</strong>
@@ -632,8 +699,8 @@ but performance may be significantly affected.
 </table>
 </div>
 </section>
-<section id="id8">
-<h3>Static Variables<a class="headerlink" href="#id8" title="Link to this heading">#</a></h3>
+<section id="id11">
+<h3>Static Variables<a class="headerlink" href="#id11" title="Link to this heading">#</a></h3>
 <p>Due to differences between implementations of regridding methods, it is recommended to use
 <a class="reference external" href="https://huggingface.co/microsoft/aurora/blob/main/aurora-0.1-static.pickle">the exact static variables which we used during training</a>.</p>
 <p>It is also possible to use the
@@ -650,7 +717,7 @@ You can do that in the following way:</p>
     <span class="n">surf_stats</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;z&quot;</span><span class="p">:</span> <span class="p">(</span><span class="o">-</span><span class="mf">3.270407e03</span><span class="p">,</span> <span class="mf">6.540335e04</span><span class="p">)},</span>
 <span class="p">)</span>
 
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.1-finetuned.ckpt&quot;</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
 </pre></div>
 </div>
 <p>The specific values above should work reasonably.</p>
@@ -659,16 +726,124 @@ You can do that in the following way:</p>
 Generally, the first value in the tuple should be <code class="docutils literal notranslate"><span class="pre">min(static_z)</span></code>
 and the second value <code class="docutils literal notranslate"><span class="pre">max(static_z)</span> <span class="pre">-</span> <span class="pre">min(static_z)</span></code>.</p>
 </section>
-<section id="id9">
-<h3>Notes<a class="headerlink" href="#id9" title="Link to this heading">#</a></h3>
+<section id="id12">
+<h3>Notes<a class="headerlink" href="#id12" title="Link to this heading">#</a></h3>
 <p><a class="reference internal" href="#lora-or-no-lora"><span class="std std-ref">Like for Aurora 0.25° Fine-Tuned</span></a>,
 you can turn off LoRA to obtain more realistic predictions at the expensive of slightly higher long-term MSE:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraHighRes</span>
 
 <span class="n">model</span> <span class="o">=</span> <span class="n">AuroraHighRes</span><span class="p">(</span><span class="n">use_lora</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># Disable LoRA for more realistic samples.</span>
-<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.1-finetuned.ckpt&quot;</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </pre></div>
 </div>
+</section>
+</section>
+<section id="aurora-0-4-air-pollution">
+<span id="aurora-air-pollution"></span><h2>Aurora 0.4° Air Pollution<a class="headerlink" href="#aurora-0-4-air-pollution" title="Link to this heading">#</a></h2>
+<p>Aurora 0.4° Air Pollution is Aurora 0.25° Pretrained fine-tuned on
+<a class="reference external" href="https://ads.atmosphere.copernicus.eu/datasets/cams-global-atmospheric-composition-forecasts">CAMS analysis data</a>.
+This version of Aurora is capable of making air pollution forecasts.</p>
+<section id="id13">
+<h3>Usage<a class="headerlink" href="#id13" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraAirPollution</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraAirPollution</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="id14">
+<h3>Recommended Use<a class="headerlink" href="#id14" title="Link to this heading">#</a></h3>
+<p>Use Aurora 0.4° Air Pollution if you aim to make predictions for CAMS analysis.
+Note that 0.4° resolution means that the data should have dimensions <code class="docutils literal notranslate"><span class="pre">(451,</span> <span class="pre">900)</span></code>.</p>
+<p><strong>Important:</strong>
+For optimal performance, it is crucial that you only run Aurora 0.4° Air Pollution on CAMS analysis data.
+Producing predictions for any other data set might give sensible predictions,
+but performance may not be optimal anymore.</p>
+<p>For optimal performance, the model requires the following variables and pressure levels:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Required</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Surface-level variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2t</span></code>, <code class="docutils literal notranslate"><span class="pre">10u</span></code>, <code class="docutils literal notranslate"><span class="pre">10v</span></code>, <code class="docutils literal notranslate"><span class="pre">msl</span></code>, <code class="docutils literal notranslate"><span class="pre">pm1</span></code>, <code class="docutils literal notranslate"><span class="pre">pm2p5</span></code>, <code class="docutils literal notranslate"><span class="pre">pm10</span></code>, <code class="docutils literal notranslate"><span class="pre">tcco</span></code>, <code class="docutils literal notranslate"><span class="pre">tc_no</span></code>, <code class="docutils literal notranslate"><span class="pre">tcno2</span></code>, <code class="docutils literal notranslate"><span class="pre">tcso2</span></code>, <code class="docutils literal notranslate"><span class="pre">gtco3</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Static variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lsm</span></code>, <code class="docutils literal notranslate"><span class="pre">slt</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code>, <code class="docutils literal notranslate"><span class="pre">static_ammonia</span></code>, <code class="docutils literal notranslate"><span class="pre">static_ammonia_log</span></code>, <code class="docutils literal notranslate"><span class="pre">static_co</span></code>, <code class="docutils literal notranslate"><span class="pre">static_co_log</span></code>, <code class="docutils literal notranslate"><span class="pre">static_nox</span></code>, <code class="docutils literal notranslate"><span class="pre">static_nox_log</span></code>, <code class="docutils literal notranslate"><span class="pre">static_so2</span></code>, <code class="docutils literal notranslate"><span class="pre">static_so2_log</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Atmospheric variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">t</span></code>, <code class="docutils literal notranslate"><span class="pre">u</span></code>, <code class="docutils literal notranslate"><span class="pre">v</span></code>, <code class="docutils literal notranslate"><span class="pre">q</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code>, <code class="docutils literal notranslate"><span class="pre">co</span></code>, <code class="docutils literal notranslate"><span class="pre">no</span></code>, <code class="docutils literal notranslate"><span class="pre">no2</span></code>, <code class="docutils literal notranslate"><span class="pre">so2</span></code>, <code class="docutils literal notranslate"><span class="pre">go3</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Pressure levels (hPa)</p></td>
+<td><p>50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id15">
+<h3>Static Variables<a class="headerlink" href="#id15" title="Link to this heading">#</a></h3>
+<p>Aurora 0.4° Air Pollution requires
+<a class="reference external" href="https://huggingface.co/microsoft/aurora/resolve/main/aurora-0.4-air-pollution-static.pickle">static variables from the HuggingFace repository</a>.</p>
+</section>
+</section>
+<section id="aurora-0-25-wave">
+<span id="aurora-wave"></span><h2>Aurora 0.25° Wave<a class="headerlink" href="#aurora-0-25-wave" title="Link to this heading">#</a></h2>
+<p>Aurora 0.25° Wave is Aurora 0.25° Pretrained fine-tuned on
+<a class="reference external" href="https://www.ecmwf.int/en/forecasts/datasets/set-ii">HRES-WAM ocean wave data</a>.
+This version of Aurora is capable of making ocean wave forecasts.</p>
+<section id="id16">
+<h3>Usage<a class="headerlink" href="#id16" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraWave</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraWave</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="id17">
+<h3>Recommended Use<a class="headerlink" href="#id17" title="Link to this heading">#</a></h3>
+<p>Use Aurora 0.25° Wave if you aim to make predictions for HRES-WAM analysis data combined with HRES T0.</p>
+<p><strong>Important:</strong>
+Some specific postprocessing applies to the HRES-WAM data.
+See Section C.5 of the <a class="reference external" href="https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-025-09005-y/MediaObjects/41586_2025_9005_MOESM1_ESM.pdf">Supplementary Information</a>.</p>
+<p><strong>Important:</strong>
+For optimal performance, it is crucial that you only run Aurora 0.25° Wave on batches with all
+meteorological variables taken from HRES T0 and all ocean wave variables taken from HRES-WAM
+analysis.
+Producing predictions for any other combination might give sensible predictions,
+but performance may not be optimal anymore.</p>
+<p>For optimal performance, the model requires the following variables and pressure levels:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Required</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Surface-level variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2t</span></code>, <code class="docutils literal notranslate"><span class="pre">10u</span></code>, <code class="docutils literal notranslate"><span class="pre">10v</span></code>, <code class="docutils literal notranslate"><span class="pre">swh</span></code>, <code class="docutils literal notranslate"><span class="pre">mwd</span></code>, <code class="docutils literal notranslate"><span class="pre">mwp</span></code>, <code class="docutils literal notranslate"><span class="pre">pp1d</span></code>, <code class="docutils literal notranslate"><span class="pre">shww</span></code>, <code class="docutils literal notranslate"><span class="pre">mdww</span></code>, <code class="docutils literal notranslate"><span class="pre">mpww</span></code>, <code class="docutils literal notranslate"><span class="pre">shts</span></code>, <code class="docutils literal notranslate"><span class="pre">mdts</span></code>, <code class="docutils literal notranslate"><span class="pre">mpts</span></code>, <code class="docutils literal notranslate"><span class="pre">swh1</span></code>, <code class="docutils literal notranslate"><span class="pre">mwd1</span></code>, <code class="docutils literal notranslate"><span class="pre">mwp1</span></code>, <code class="docutils literal notranslate"><span class="pre">swh2</span></code>, <code class="docutils literal notranslate"><span class="pre">mwd2</span></code>, <code class="docutils literal notranslate"><span class="pre">mwp2</span></code>, <code class="docutils literal notranslate"><span class="pre">10u_wave</span></code>, <code class="docutils literal notranslate"><span class="pre">10v_wave</span></code>, <code class="docutils literal notranslate"><span class="pre">wind</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Static variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">lsm</span></code>, <code class="docutils literal notranslate"><span class="pre">slt</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code>, <code class="docutils literal notranslate"><span class="pre">wmb</span></code>, <code class="docutils literal notranslate"><span class="pre">lat_mask</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Atmospheric variables</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">t</span></code>, <code class="docutils literal notranslate"><span class="pre">u</span></code>, <code class="docutils literal notranslate"><span class="pre">v</span></code>, <code class="docutils literal notranslate"><span class="pre">q</span></code>, <code class="docutils literal notranslate"><span class="pre">z</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Pressure levels (hPa)</p></td>
+<td><p>50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="id18">
+<h3>Static Variables<a class="headerlink" href="#id18" title="Link to this heading">#</a></h3>
+<p>Aurora 0.25° Wave requires
+<a class="reference external" href="https://huggingface.co/microsoft/aurora/resolve/main/aurora-0.25-wave-static.pickle">static variables from the HuggingFace repository</a>.</p>
 </section>
 </section>
 </section>
@@ -713,11 +888,11 @@ you can turn off LoRA to obtain more realistic predictions at the expensive of s
       </div>
     </a>
     <a class="right-next"
-       href="beware.html"
+       href="tracking.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Beware!</p>
+        <p class="prev-next-title">Tropical Cyclone Tracking</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -743,7 +918,7 @@ you can turn off LoRA to obtain more realistic predictions at the expensive of s
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#static-variables">Static Variables</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-pretrained-small">Aurora 0.25° Pretrained Small</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-small-pretrained">Aurora 0.25° Small Pretrained</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Usage</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Recommended Use</a></li>
 </ul>
@@ -755,11 +930,29 @@ you can turn off LoRA to obtain more realistic predictions at the expensive of s
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-1-fine-tuned">Aurora 0.1° Fine-Tuned</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-12-hour-pretrained">Aurora 0.25° 12-Hour Pretrained</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Usage</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Recommended Use</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">Static Variables</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">Notes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-1-fine-tuned">Aurora 0.1° Fine-Tuned</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id10">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id11">Static Variables</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id12">Notes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-4-air-pollution">Aurora 0.4° Air Pollution</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id13">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id14">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id15">Static Variables</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora-0-25-wave">Aurora 0.25° Wave</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id16">Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id17">Recommended Use</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id18">Static Variables</a></li>
 </ul>
 </li>
 </ul>

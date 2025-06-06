@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 
 
-<html lang="en" data-content_root="./" >
+<html lang="en" data-content_root="./" data-theme="light">
 
   <head>
     <meta charset="utf-8" />
@@ -13,8 +13,8 @@
   
   
   <script data-cfasync="false">
-    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
-    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
   </script>
   
   <!-- Loaded before other Sphinx assets -->
@@ -67,7 +67,7 @@
   </head>
   
   
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
 
   
   
@@ -150,8 +150,6 @@
   
     
     
-      
-    
     
     <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
     <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
@@ -184,6 +182,7 @@
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
 <li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
@@ -193,7 +192,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
 <li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
-<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
 <ul class="nav bd-sidenav">
@@ -478,13 +480,19 @@ The regular version of Aurora can be constructed as follows:</p>
 </pre></div>
 </div>
 <p>In this example, however, we use a smaller version:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraSmall</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraSmallPretrained</span>
 
-<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraSmall</span><span class="p">()</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraSmallPretrained</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>A checkpoint can then be loaded with <code class="docutils literal notranslate"><span class="pre">model.load_checkpoint</span></code> by specifying a checkpoint file in a HuggingFace repository.
-In this case, we use <code class="docutils literal notranslate"><span class="pre">aurora-0.25-small-pretrained.ckpt</span></code> from the repository <code class="docutils literal notranslate"><span class="pre">microsoft/aurora</span></code>:</p>
+<p>The checkpoint can then be loaded with <code class="docutils literal notranslate"><span class="pre">model.load_checkpoint</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>Instead of loading the default checkpoint,
+you can also load another checkpoint by specifying a checkpoint file in a HuggingFace repository.
+For example, we could use <code class="docutils literal notranslate"><span class="pre">aurora-0.25-small-pretrained.ckpt</span></code> from the repository
+<code class="docutils literal notranslate"><span class="pre">microsoft/aurora</span></code> (which is the default in this case):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="s2">&quot;microsoft/aurora&quot;</span><span class="p">,</span> <span class="s2">&quot;aurora-0.25-small-pretrained.ckpt&quot;</span><span class="p">)</span>
 </pre></div>
 </div>

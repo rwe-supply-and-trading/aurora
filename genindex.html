@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 
 
-<html lang="en" data-content_root="./" >
+<html lang="en" data-content_root="./" data-theme="light">
 
   <head>
     <meta charset="utf-8" />
@@ -12,8 +12,8 @@
   
   
   <script data-cfasync="false">
-    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
-    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
   </script>
   
   <!-- Loaded before other Sphinx assets -->
@@ -64,7 +64,7 @@
   </head>
   
   
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
 
   
   
@@ -149,8 +149,6 @@
   
     
     
-      
-    
     
     <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
     <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
@@ -183,6 +181,7 @@
 <li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
 <li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
@@ -192,7 +191,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
 <li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
-<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
 <ul class="nav bd-sidenav">
@@ -358,6 +360,7 @@ document.write(`
  | <a href="#A"><strong>A</strong></a>
  | <a href="#B"><strong>B</strong></a>
  | <a href="#C"><strong>C</strong></a>
+ | <a href="#D"><strong>D</strong></a>
  | <a href="#F"><strong>F</strong></a>
  | <a href="#L"><strong>L</strong></a>
  | <a href="#M"><strong>M</strong></a>
@@ -389,18 +392,46 @@ document.write(`
 </li>
       <li><a href="api.html#aurora.Aurora">Aurora (class in aurora)</a>
 </li>
-      <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraFineTuned">AuroraFineTuned (class in aurora.foundry.common.model)</a>
-</li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#aurora.AuroraHighRes">AuroraHighRes (in module aurora)</a>
-</li>
-      <li><a href="foundry/api.html#aurora.foundry.server.mlflow_wrapper.AuroraModelWrapper">AuroraModelWrapper() (in module aurora.foundry.server.mlflow_wrapper)</a>
-</li>
-      <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraSmall">AuroraSmall (class in aurora.foundry.common.model)</a>
+      <li><a href="api.html#aurora.Aurora12hPretrained">Aurora12hPretrained (class in aurora)</a>
 
       <ul>
-        <li><a href="api.html#aurora.AuroraSmall">(in module aurora)</a>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.Aurora12hPretrained">(class in aurora.foundry.common.model)</a>
+</li>
+      </ul></li>
+      <li><a href="api.html#aurora.AuroraAirPollution">AuroraAirPollution (class in aurora)</a>
+
+      <ul>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraAirPollution">(class in aurora.foundry.common.model)</a>
+</li>
+      </ul></li>
+      <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraFineTuned">AuroraFineTuned (class in aurora.foundry.common.model)</a>
+</li>
+      <li><a href="api.html#aurora.AuroraHighRes">AuroraHighRes (class in aurora)</a>
+
+      <ul>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraHighRes">(class in aurora.foundry.common.model)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="foundry/api.html#aurora.foundry.server.mlflow_wrapper.AuroraModelWrapper">AuroraModelWrapper() (in module aurora.foundry.server.mlflow_wrapper)</a>
+</li>
+      <li><a href="api.html#aurora.AuroraPretrained">AuroraPretrained (class in aurora)</a>
+
+      <ul>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraPretrained">(class in aurora.foundry.common.model)</a>
+</li>
+      </ul></li>
+      <li><a href="api.html#aurora.AuroraSmallPretrained">AuroraSmallPretrained (class in aurora)</a>
+
+      <ul>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraSmallPretrained">(class in aurora.foundry.common.model)</a>
+</li>
+      </ul></li>
+      <li><a href="api.html#aurora.AuroraWave">AuroraWave (class in aurora)</a>
+
+      <ul>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraWave">(class in aurora.foundry.common.model)</a>
 </li>
       </ul></li>
   </ul></td>
@@ -411,6 +442,12 @@ document.write(`
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#aurora.Batch">Batch (class in aurora)</a>
 </li>
+      <li><a href="api.html#aurora.Aurora.batch_transform_hook">batch_transform_hook() (aurora.Aurora method)</a>
+
+      <ul>
+        <li><a href="api.html#aurora.AuroraWave.batch_transform_hook">(aurora.AuroraWave method)</a>
+</li>
+      </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="foundry/api.html#aurora.foundry.common.channel.BlobStorageChannel">BlobStorageChannel (class in aurora.foundry.common.channel)</a>
@@ -426,6 +463,32 @@ document.write(`
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#aurora.Batch.crop">crop() (aurora.Batch method)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="D">D</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="api.html#aurora.Aurora.default_checkpoint_name">default_checkpoint_name (aurora.Aurora attribute)</a>
+
+      <ul>
+        <li><a href="api.html#aurora.Aurora12hPretrained.default_checkpoint_name">(aurora.Aurora12hPretrained attribute)</a>
+</li>
+        <li><a href="api.html#aurora.AuroraAirPollution.default_checkpoint_name">(aurora.AuroraAirPollution attribute)</a>
+</li>
+        <li><a href="api.html#aurora.AuroraHighRes.default_checkpoint_name">(aurora.AuroraHighRes attribute)</a>
+</li>
+        <li><a href="api.html#aurora.AuroraPretrained.default_checkpoint_name">(aurora.AuroraPretrained attribute)</a>
+</li>
+        <li><a href="api.html#aurora.AuroraSmallPretrained.default_checkpoint_name">(aurora.AuroraSmallPretrained attribute)</a>
+</li>
+        <li><a href="api.html#aurora.AuroraWave.default_checkpoint_name">(aurora.AuroraWave attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="api.html#aurora.Aurora.default_checkpoint_repo">default_checkpoint_repo (aurora.Aurora attribute)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -467,10 +530,20 @@ document.write(`
 <h2 id="N">N</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraFineTuned.name">name (aurora.foundry.common.model.AuroraFineTuned attribute)</a>
+      <li><a href="foundry/api.html#aurora.foundry.common.model.Aurora12hPretrained.name">name (aurora.foundry.common.model.Aurora12hPretrained attribute)</a>
 
       <ul>
-        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraSmall.name">(aurora.foundry.common.model.AuroraSmall attribute)</a>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraAirPollution.name">(aurora.foundry.common.model.AuroraAirPollution attribute)</a>
+</li>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraFineTuned.name">(aurora.foundry.common.model.AuroraFineTuned attribute)</a>
+</li>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraHighRes.name">(aurora.foundry.common.model.AuroraHighRes attribute)</a>
+</li>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraPretrained.name">(aurora.foundry.common.model.AuroraPretrained attribute)</a>
+</li>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraSmallPretrained.name">(aurora.foundry.common.model.AuroraSmallPretrained attribute)</a>
+</li>
+        <li><a href="foundry/api.html#aurora.foundry.common.model.AuroraWave.name">(aurora.foundry.common.model.AuroraWave attribute)</a>
 </li>
       </ul></li>
   </ul></td>
@@ -487,6 +560,8 @@ document.write(`
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="api.html#aurora.Tracker.results">results() (aurora.Tracker method)</a>
+</li>
       <li><a href="api.html#aurora.rollout">rollout (class in aurora)</a>
 </li>
   </ul></td>
@@ -499,6 +574,8 @@ document.write(`
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="api.html#aurora.Tracker.step">step() (aurora.Tracker method)</a>
+</li>
       <li><a href="foundry/api.html#aurora.foundry.client.api.submit">submit() (in module aurora.foundry.client.api)</a>
 </li>
   </ul></td>
@@ -509,9 +586,11 @@ document.write(`
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#aurora.Batch.to">to() (aurora.Batch method)</a>
 </li>
+      <li><a href="api.html#aurora.Batch.to_netcdf">to_netcdf() (aurora.Batch method)</a>
+</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#aurora.Batch.to_netcdf">to_netcdf() (aurora.Batch method)</a>
+      <li><a href="api.html#aurora.Tracker">Tracker (class in aurora)</a>
 </li>
       <li><a href="api.html#aurora.Batch.type">type() (aurora.Batch method)</a>
 </li>
