@@ -25,7 +25,7 @@ __all__ = ["Aurora", "AuroraSmall", "AuroraHighRes"]
 class Aurora(torch.nn.Module):
     """The Aurora model.
 
-    Defaults to to the 1.3 B parameter configuration.
+    Defaults to the 1.3 B parameter configuration.
     """
 
     def __init__(
@@ -58,6 +58,8 @@ class Aurora(torch.nn.Module):
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
         normalise: bool = True,
+        s2s: bool = False,
+        train_with_s2s: bool = False,
     ) -> None:
         """Construct an instance of the model.
 
@@ -116,6 +118,10 @@ class Aurora(torch.nn.Module):
             normalise (bool, optional): Normalise (and un-normalise) the input data. Defaults to `True`.
         """
         super().__init__()
+
+        if s2s: 
+            self.surf_vars = surf_vars + ("2t", "10u", "10v", "msl")
+        )
         self.surf_vars = surf_vars
         self.atmos_vars = atmos_vars
         self.patch_size = patch_size
