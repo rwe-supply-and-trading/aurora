@@ -197,6 +197,9 @@ class Aurora(torch.nn.Module):
                 "If you are not normalising outside of the model, check your model settings.",
                 stacklevel=2,
             )
+        self.use_lora = use_lora
+        self.positive_surf_vars = positive_surf_vars
+        self.positive_atmos_vars = positive_atmos_vars
 
         if self.surf_stats and self.normalise:
             warnings.warn(
@@ -377,6 +380,21 @@ class Aurora(torch.nn.Module):
         if self.normalise:
             pred = pred.unnormalise(surf_stats=self.surf_stats)
 
+        return pred
+
+    def batch_transform_hook(self, batch: Batch) -> Batch:
+        """Transform the batch right after receiving it and before normalisation.
+
+        This function should be idempotent.
+        """
+        return batch
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        """Transform the batch before it goes through the encoder."""
+        return batch
+
+    def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
+        """Transform the prediction right after the decoder."""
         return pred
 
     def batch_transform_hook(self, batch: Batch) -> Batch:
