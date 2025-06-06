@@ -4,32 +4,54 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from functools import partial
 from typing import Optional
 
+import numpy as np
 import torch
+import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 
 from aurora.batch import Batch
+from aurora.model.compat import (
+    _adapt_checkpoint_air_pollution,
+    _adapt_checkpoint_pretrained,
+    _adapt_checkpoint_wave,
+)
 from aurora.model.decoder import Perceiver3DDecoder
 from aurora.model.encoder import Perceiver3DEncoder
 from aurora.model.lora import LoRAMode
 from aurora.model.swin3d import BasicLayer3D, Swin3DTransformerBackbone
 
-__all__ = ["Aurora", "AuroraSmall", "AuroraHighRes"]
+__all__ = [
+    "Aurora",
+    "AuroraPretrained",
+    "AuroraSmallPretrained",
+    "AuroraSmall",
+    "Aurora12hPretrained",
+    "AuroraHighRes",
+    "AuroraAirPollution",
+    "AuroraWave",
+]
 
 
 class Aurora(torch.nn.Module):
     """The Aurora model.
 
-    Defaults to to the 1.3 B parameter configuration.
+    Defaults to the 1.3 B parameter configuration.
     """
+
+    default_checkpoint_repo = "microsoft/aurora"
+    """str: Name of the HuggingFace repository to load the default checkpoint from."""
+
+    default_checkpoint_name = "aurora-0.25-finetuned.ckpt"
+    """str: Name of the default checkpoint."""
 
     def __init__(
         self,
+        *,
         surf_vars: tuple[str, ...] = ("2t", "10u", "10v", "msl"),
         static_vars: tuple[str, ...] = ("lsm", "z", "slt"),
         atmos_vars: tuple[str, ...] = ("z", "u", "v", "t", "q"),
@@ -57,6 +79,14 @@ class Aurora(torch.nn.Module):
         lora_mode: LoRAMode = "single",
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         autocast: bool = False,
+        level_condition: Optional[tuple[int | float, ...]] = None,
+        dynamic_vars: bool = False,
+        atmos_static_vars: bool = False,
+        separate_perceiver: tuple[str, ...] = (),
+        modulation_head: bool = False,
+        positive_surf_vars: tuple[str, ...] = (),
+        positive_atmos_vars: tuple[str, ...] = (),
+        simulate_indexing_bug: bool = False,
     ) -> None:
         """Construct an instance of the model.
 
@@ -105,13 +135,38 @@ class Aurora(torch.nn.Module):
             lora_steps (int, optional): Use different LoRA adaptation for the first so-many roll-out
                 steps.
             lora_mode (str, optional): LoRA mode. `"single"` uses the same LoRA for all roll-out
-                steps, and `"all"` uses a different LoRA for every roll-out step. Defaults to
-                `"single"`.
+                steps, `"from_second"` uses the same LoRA from the second roll-out step on, and
+                `"all"` uses a different LoRA for every roll-out step. Defaults to `"single"`.
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
             autocast (bool, optional): Use `torch.autocast` to reduce memory usage. Defaults to
                 `False`.
+            level_condition (tuple[int | float, ...], optional): Make the patch embeddings dependent
+                on pressure level. If you want to enable this feature, provide a tuple of all
+                possible pressure levels.
+            dynamic_vars (bool, optional): Use dynamically generated static variables, like time
+                of day. Defaults to `False`.
+            atmos_static_vars (bool, optional): Also concatenate the static variables to the
+                atmospheric variables. Defaults to `False`.
+            separate_perceiver (tuple[str, ...], optional): In the decoder, use a separate Perceiver
+                for specific atmospheric variables. This can be helpful at fine-tuning time to deal
+                with variables that have a significantly different behaviour. If you want to enable
+                this features, set this to the collection of variables that should be run on a
+                separate Perceiver.
+            modulation_head (bool, optional): Enable an additional head, the so-called modulation
+                head, that can be used to predict the difference. Defaults to `False`.
+            positive_surf_vars (tuple[str, ...], optional): Mark these surface-level variables as
+                positive. Clamp them before running them through the encoder, and also clamp them
+                when autoregressively rolling out the model. The variables are not clamped for the
+                first roll-out step.
+            positive_atmos_vars (tuple[str, ...], optional): Mark these atmospheric variables as
+                positive. Clamp them before running them through the encoder, and also clamp them
+                when autoregressively rolling out the model. The variables are not clamped for the
+                first roll-out step.
+            simulate_indexing_bug (bool, optional): Simulate an indexing bug that's present for the
+                air pollution version of Aurora. This is necessary to obtain numerical equivalence
+                to the original implementation. Defaults to `False`.
         """
         super().__init__()
         self.surf_vars = surf_vars
@@ -121,6 +176,9 @@ class Aurora(torch.nn.Module):
         self.autocast = autocast
         self.max_history_size = max_history_size
         self.timestep = timestep
+        self.use_lora = use_lora
+        self.positive_surf_vars = positive_surf_vars
+        self.positive_atmos_vars = positive_atmos_vars
 
         if self.surf_stats:
             warnings.warn(
@@ -145,6 +203,10 @@ class Aurora(torch.nn.Module):
             max_history_size=max_history_size,
             perceiver_ln_eps=perceiver_ln_eps,
             stabilise_level_agg=stabilise_level_agg,
+            level_condition=level_condition,
+            dynamic_vars=dynamic_vars,
+            atmos_static_vars=atmos_static_vars,
+            simulate_indexing_bug=simulate_indexing_bug,
         )
 
         self.backbone = Swin3DTransformerBackbone(
@@ -175,6 +237,9 @@ class Aurora(torch.nn.Module):
             # We use a lower ratio here to keep the memory in check.
             mlp_ratio=dec_mlp_ratio,
             perceiver_ln_eps=perceiver_ln_eps,
+            level_condition=level_condition,
+            separate_perceiver=separate_perceiver,
+            modulation_head=modulation_head,
         )
 
     def forward(self, batch: Batch) -> Batch:
@@ -186,6 +251,8 @@ class Aurora(torch.nn.Module):
         Returns:
             :class:`Batch`: Prediction for the batch.
         """
+        batch = self.batch_transform_hook(batch)
+
         # Get the first parameter. We'll derive the data type and device from this parameter.
         p = next(self.parameters())
         batch = batch.type(p.dtype)
@@ -207,8 +274,32 @@ class Aurora(torch.nn.Module):
             static_vars={k: v[None, None].repeat(B, T, 1, 1) for k, v in batch.static_vars.items()},
         )
 
+        # Apply some transformations before feeding `batch` to the encoder. We'll later want to
+        # refer to the original batch too, so rename the variable.
+        transformed_batch = batch
+
+        # Clamp positive variables.
+        if self.positive_surf_vars:
+            transformed_batch = dataclasses.replace(
+                transformed_batch,
+                surf_vars={
+                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
+                    for k, v in batch.surf_vars.items()
+                },
+            )
+        if self.positive_atmos_vars:
+            transformed_batch = dataclasses.replace(
+                transformed_batch,
+                atmos_vars={
+                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
+                    for k, v in batch.atmos_vars.items()
+                },
+            )
+
+        transformed_batch = self._pre_encoder_hook(transformed_batch)
+
         x = self.encoder(
-            batch,
+            transformed_batch,
             lead_time=self.timestep,
         )
         with torch.autocast(device_type="cuda") if self.autocast else contextlib.nullcontext():
@@ -238,20 +329,62 @@ class Aurora(torch.nn.Module):
             atmos_vars={k: v[:, None] for k, v in pred.atmos_vars.items()},
         )
 
+        pred = self._post_decoder_hook(batch, pred)
+
+        # Clamp positive variables.
+        if self.positive_surf_vars and pred.metadata.rollout_step > 1:
+            pred = dataclasses.replace(
+                pred,
+                surf_vars={
+                    k: v.clamp(min=0) if k in self.positive_surf_vars else v
+                    for k, v in pred.surf_vars.items()
+                },
+            )
+        if self.positive_atmos_vars and pred.metadata.rollout_step > 1:
+            pred = dataclasses.replace(
+                pred,
+                atmos_vars={
+                    k: v.clamp(min=0) if k in self.positive_atmos_vars else v
+                    for k, v in pred.atmos_vars.items()
+                },
+            )
+
         pred = pred.unnormalise(surf_stats=self.surf_stats)
 
         return pred
 
-    def load_checkpoint(self, repo: str, name: str, strict: bool = True) -> None:
+    def batch_transform_hook(self, batch: Batch) -> Batch:
+        """Transform the batch right after receiving it and before normalisation.
+
+        This function should be idempotent.
+        """
+        return batch
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        """Transform the batch before it goes through the encoder."""
+        return batch
+
+    def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
+        """Transform the prediction right after the decoder."""
+        return pred
+
+    def load_checkpoint(
+        self,
+        repo: Optional[str] = None,
+        name: Optional[str] = None,
+        strict: bool = True,
+    ) -> None:
         """Load a checkpoint from HuggingFace.
 
         Args:
-            repo (str): Name of the repository of the form `user/repo`.
-            name (str): Path to the checkpoint relative to the root of the repository, e.g.
-                `checkpoint.cpkt`.
+            repo (str, optional): Name of the repository of the form `user/repo`.
+            name (str, optional): Path to the checkpoint relative to the root of the repository,
+                e.g. `checkpoint.cpkt`.
             strict (bool, optional): Error if the model parameters are not exactly equal to the
                 parameters in the checkpoint. Defaults to `True`.
         """
+        repo = repo or self.default_checkpoint_repo
+        name = name or self.default_checkpoint_name
         path = hf_hub_download(repo_id=repo, filename=name)
         self.load_checkpoint_local(path, strict=strict)
 
@@ -265,65 +398,9 @@ class Aurora(torch.nn.Module):
         """
         # Assume that all parameters are either on the CPU or on the GPU.
         device = next(self.parameters()).device
-
         d = torch.load(path, map_location=device, weights_only=True)
 
-        # You can safely ignore all cumbersome processing below. We modified the model after we
-        # trained it. The code below manually adapts the checkpoints, so the checkpoints are
-        # compatible with the new model.
-
-        # Remove possibly prefix from the keys.
-        for k, v in list(d.items()):
-            if k.startswith("net."):
-                del d[k]
-                d[k[4:]] = v
-
-        # Convert the ID-based parametrization to a name-based parametrization.
-        if "encoder.surf_token_embeds.weight" in d:
-            weight = d["encoder.surf_token_embeds.weight"]
-            del d["encoder.surf_token_embeds.weight"]
-
-            assert weight.shape[1] == 4 + 3
-            for i, name in enumerate(("2t", "10u", "10v", "msl", "lsm", "z", "slt")):
-                d[f"encoder.surf_token_embeds.weights.{name}"] = weight[:, [i]]
-
-        if "encoder.atmos_token_embeds.weight" in d:
-            weight = d["encoder.atmos_token_embeds.weight"]
-            del d["encoder.atmos_token_embeds.weight"]
-
-            assert weight.shape[1] == 5
-            for i, name in enumerate(("z", "u", "v", "t", "q")):
-                d[f"encoder.atmos_token_embeds.weights.{name}"] = weight[:, [i]]
-
-        if "decoder.surf_head.weight" in d:
-            weight = d["decoder.surf_head.weight"]
-            bias = d["decoder.surf_head.bias"]
-            del d["decoder.surf_head.weight"]
-            del d["decoder.surf_head.bias"]
-
-            assert weight.shape[0] == 4 * self.patch_size**2
-            assert bias.shape[0] == 4 * self.patch_size**2
-            weight = weight.reshape(self.patch_size**2, 4, -1)
-            bias = bias.reshape(self.patch_size**2, 4)
-
-            for i, name in enumerate(("2t", "10u", "10v", "msl")):
-                d[f"decoder.surf_heads.{name}.weight"] = weight[:, i]
-                d[f"decoder.surf_heads.{name}.bias"] = bias[:, i]
-
-        if "decoder.atmos_head.weight" in d:
-            weight = d["decoder.atmos_head.weight"]
-            bias = d["decoder.atmos_head.bias"]
-            del d["decoder.atmos_head.weight"]
-            del d["decoder.atmos_head.bias"]
-
-            assert weight.shape[0] == 5 * self.patch_size**2
-            assert bias.shape[0] == 5 * self.patch_size**2
-            weight = weight.reshape(self.patch_size**2, 5, -1)
-            bias = bias.reshape(self.patch_size**2, 5)
-
-            for i, name in enumerate(("z", "u", "v", "t", "q")):
-                d[f"decoder.atmos_heads.{name}.weight"] = weight[:, i]
-                d[f"decoder.atmos_heads.{name}.bias"] = bias[:, i]
+        d = self._adapt_checkpoint(d)
 
         # Check if the history size is compatible and adjust weights if necessary.
         current_history_size = d["encoder.surf_token_embeds.weights.2t"].shape[2]
@@ -336,6 +413,17 @@ class Aurora(torch.nn.Module):
             )
 
         self.load_state_dict(d, strict=strict)
+
+    def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Adapt an existing checkpoint to make it compatible with the current version of the model.
+
+        Args:
+            d (dict[str, torch.Tensor]): Checkpoint.
+
+        Return:
+            dict[str, torch.Tensor]: Adapted checkpoint.
+        """
+        return _adapt_checkpoint_pretrained(self.patch_size, d)
 
     def adapt_checkpoint_max_history_size(self, checkpoint: dict[str, torch.Tensor]) -> None:
         """Adapt a checkpoint with smaller `max_history_size` to a model with a larger
@@ -382,20 +470,380 @@ class Aurora(torch.nn.Module):
         apply_activation_checkpointing(self, check_fn=lambda x: isinstance(x, BasicLayer3D))
 
 
-AuroraSmall = partial(
-    Aurora,
-    encoder_depths=(2, 6, 2),
-    encoder_num_heads=(4, 8, 16),
-    decoder_depths=(2, 6, 2),
-    decoder_num_heads=(16, 8, 4),
-    embed_dim=256,
-    num_heads=8,
-    use_lora=False,
-)
+class AuroraPretrained(Aurora):
+    """Pretrained version of Aurora."""
 
-AuroraHighRes = partial(
-    Aurora,
-    patch_size=10,
-    encoder_depths=(6, 8, 8),
-    decoder_depths=(8, 8, 6),
-)
+    default_checkpoint_name = "aurora-0.25-pretrained.ckpt"
+
+    def __init__(
+        self,
+        *,
+        use_lora: bool = False,
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            use_lora=use_lora,
+            **kw_args,
+        )
+
+
+class AuroraSmallPretrained(Aurora):
+    """Small pretrained version of Aurora.
+
+    Should only be used for debugging.
+    """
+
+    default_checkpoint_name = "aurora-0.25-small-pretrained.ckpt"
+
+    def __init__(
+        self,
+        *,
+        encoder_depths: tuple[int, ...] = (2, 6, 2),
+        encoder_num_heads: tuple[int, ...] = (4, 8, 16),
+        decoder_depths: tuple[int, ...] = (2, 6, 2),
+        decoder_num_heads: tuple[int, ...] = (16, 8, 4),
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        use_lora: bool = False,
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            encoder_depths=encoder_depths,
+            encoder_num_heads=encoder_num_heads,
+            decoder_depths=decoder_depths,
+            decoder_num_heads=decoder_num_heads,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            use_lora=use_lora,
+            **kw_args,
+        )
+
+
+AuroraSmall = AuroraSmallPretrained  #: Alias for backwards compatibility
+
+
+class Aurora12hPretrained(Aurora):
+    """Pretrained version of Aurora with time step 12 hours."""
+
+    default_checkpoint_name = "aurora-0.25-12h-pretrained.ckpt"
+
+    def __init__(
+        self,
+        *,
+        timestep: timedelta = timedelta(hours=12),
+        use_lora: bool = False,
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            timestep=timestep,
+            use_lora=use_lora,
+            **kw_args,
+        )
+
+
+class AuroraHighRes(Aurora):
+    """High-resolution version of Aurora."""
+
+    default_checkpoint_name = "aurora-0.1-finetuned.ckpt"
+
+    def __init(
+        self,
+        *,
+        patch_size: int = 10,
+        encoder_depths: tuple[int, ...] = (6, 8, 8),
+        decoder_depths: tuple[int, ...] = (8, 8, 6),
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            patch_size=patch_size,
+            encoder_depths=encoder_depths,
+            decoder_depths=decoder_depths,
+            **kw_args,
+        )
+
+
+class AuroraAirPollution(Aurora):
+    """Fine-tuned version of Aurora for air pollution."""
+
+    default_checkpoint_name = "aurora-0.4-air-pollution.ckpt"
+
+    _predict_difference_history_dim_lookup = {
+        "pm1": 0,
+        "pm2p5": 0,
+        "pm10": 0,
+        "co": 1,
+        "tcco": 1,
+        "no": 0,
+        "tc_no": 0,
+        "no2": 0,
+        "tcno2": 0,
+        "so2": 1,
+        "tcso2": 1,
+        "go3": 1,
+        "gtco3": 1,
+    }
+    """dict[str, int]: For every variable that we want to predict the difference for, the index
+    into the history dimension that should be used when predicting the difference."""
+
+    def __init__(
+        self,
+        *,
+        surf_vars: tuple[str, ...] = (
+            ("2t", "10u", "10v", "msl")
+            + ("pm1", "pm2p5", "pm10", "tcco", "tc_no", "tcno2", "gtco3", "tcso2")
+        ),
+        static_vars: tuple[str, ...] = (
+            ("lsm", "z", "slt")
+            + ("static_ammonia", "static_ammonia_log", "static_co", "static_co_log")
+            + ("static_nox", "static_nox_log", "static_so2", "static_so2_log")
+        ),
+        atmos_vars: tuple[str, ...] = ("z", "u", "v", "t", "q", "co", "no", "no2", "go3", "so2"),
+        patch_size: int = 3,
+        timestep: timedelta = timedelta(hours=12),
+        level_condition: Optional[tuple[int | float, ...]] = (
+            (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)
+        ),
+        dynamic_vars: bool = True,
+        atmos_static_vars: bool = True,
+        separate_perceiver: tuple[str, ...] = ("co", "no", "no2", "go3", "so2"),
+        modulation_head: bool = True,
+        positive_surf_vars: tuple[str, ...] = (
+            ("pm1", "pm2p5", "pm10", "tcco", "tc_no", "tcno2", "gtco3", "tcso2")
+        ),
+        positive_atmos_vars: tuple[str, ...] = ("co", "no", "no2", "go3", "so2"),
+        simulate_indexing_bug: bool = True,
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            surf_vars=surf_vars,
+            static_vars=static_vars,
+            atmos_vars=atmos_vars,
+            patch_size=patch_size,
+            timestep=timestep,
+            level_condition=level_condition,
+            dynamic_vars=dynamic_vars,
+            atmos_static_vars=atmos_static_vars,
+            separate_perceiver=separate_perceiver,
+            modulation_head=modulation_head,
+            positive_surf_vars=positive_surf_vars,
+            positive_atmos_vars=positive_atmos_vars,
+            simulate_indexing_bug=simulate_indexing_bug,
+            **kw_args,
+        )
+
+        self.surf_feature_combiner = torch.nn.ParameterDict(
+            {v: nn.Linear(2, 1, bias=True) for v in self.positive_surf_vars}
+        )
+        self.atmos_feature_combiner = torch.nn.ParameterDict(
+            {v: nn.Linear(2, 1, bias=True) for v in self.positive_atmos_vars}
+        )
+        for p in (*self.surf_feature_combiner.values(), *self.atmos_feature_combiner.values()):
+            nn.init.constant_(p.weight, 0.5)
+            nn.init.zeros_(p.bias)
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        # Transform the spikey variables with a specific log-transform before feeding them
+        # to the encoder. See the paper for a motivation for the precise form of the transform.
+
+        eps = 1e-4
+        divisor = -np.log(eps)
+
+        def _transform(z: torch.Tensor, feature_combiner: nn.Module) -> torch.Tensor:
+            return feature_combiner(
+                torch.stack(
+                    [
+                        z.clamp(min=0, max=2.5),
+                        (torch.log(z.clamp(min=eps)) - np.log(eps)) / divisor,
+                    ],
+                    dim=-1,
+                )
+            )[..., 0]
+
+        return dataclasses.replace(
+            batch,
+            surf_vars={
+                k: _transform(v, self.surf_feature_combiner[k])
+                if k in self.surf_feature_combiner
+                else v
+                for k, v in batch.surf_vars.items()
+            },
+            atmos_vars={
+                k: _transform(v, self.atmos_feature_combiner[k])
+                if k in self.atmos_feature_combiner
+                else v
+                for k, v in batch.atmos_vars.items()
+            },
+        )
+
+    def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
+        # For this version of the model, we predict the difference. Specifically w.r.t. which
+        # previous timestep (12 hours ago or 24 hours ago) is given by
+        # `Aurora._predict_difference_history_dim_lookup`.
+
+        dim_lookup = AuroraAirPollution._predict_difference_history_dim_lookup
+
+        def _transform(
+            prev: dict[str, torch.Tensor],
+            model: dict[str, torch.Tensor],
+            name: str,
+        ) -> torch.Tensor:
+            if name in dim_lookup:
+                return model[name] + (1 + model[f"{name}_mod"]) * prev[name][:, dim_lookup[name]]
+            else:
+                return model[name]
+
+        pred = dataclasses.replace(
+            pred,
+            surf_vars={k: _transform(batch.surf_vars, pred.surf_vars, k) for k in batch.surf_vars},
+            atmos_vars={
+                k: _transform(batch.atmos_vars, pred.atmos_vars, k) for k in batch.atmos_vars
+            },
+        )
+
+        # When using LoRA, the lower-atmospheric levels of SO2 can be problematic and blow up.
+        # We attempt to fix that by some very aggressive output clipping.
+        if self.use_lora:
+            parts: list[torch.Tensor] = []
+            for i, level in enumerate(pred.metadata.atmos_levels):
+                section = pred.atmos_vars["so2"][..., i, :, :]
+                if level >= 850:
+                    section = section.clamp(max=1)
+                parts.append(section)
+            pred.atmos_vars["so2"] = torch.stack(parts, dim=-3)
+
+        return pred
+
+    def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        d = Aurora._adapt_checkpoint(self, d)
+        d = _adapt_checkpoint_air_pollution(self.patch_size, d)
+        return d
+
+
+class AuroraWave(Aurora):
+    """Version of Aurora fined-tuned to HRES-WAM ocean wave data."""
+
+    default_checkpoint_name = "aurora-0.25-wave.ckpt"
+
+    def __init__(
+        self,
+        *,
+        surf_vars: tuple[str, ...] = (
+            ("2t", "10u", "10v", "msl")
+            + ("swh", "mwd", "mwp", "pp1d", "shww", "mdww", "mpww", "shts", "mdts", "mpts")
+            + ("swh1", "mwd1", "mwp1", "swh2", "mwd2", "mwp2", "wind", "10u_wave", "10v_wave")
+        ),
+        static_vars: tuple[str, ...] = ("lsm", "z", "slt", "wmb", "lat_mask"),
+        lora_mode: LoRAMode = "from_second",
+        stabilise_level_agg: bool = True,
+        density_channel_surf_vars: tuple[str, ...] = (
+            ("swh", "mwd", "mwp", "pp1d", "shww", "mdww", "mpww", "shts", "mdts", "mpts")
+            + ("swh1", "mwd1", "mwp1", "swh2", "mwd2", "mwp2", "wind", "10u_wave", "10v_wave")
+        ),
+        angle_surf_vars: tuple[str, ...] = ("mwd", "mdww", "mdts", "mwd1", "mwd2"),
+        **kw_args,
+    ) -> None:
+        # Model the density, sine, and cosine versions of the variables.
+        supplemented_surf_vars: tuple[str, ...] = ()
+        for name in surf_vars:
+            if name in angle_surf_vars:
+                supplemented_surf_vars += (f"{name}_sin", f"{name}_cos")
+            else:
+                supplemented_surf_vars += (name,)
+            if name in density_channel_surf_vars:
+                supplemented_surf_vars += (f"{name}_density",)
+
+        super().__init__(
+            surf_vars=supplemented_surf_vars,
+            static_vars=static_vars,
+            lora_mode=lora_mode,
+            stabilise_level_agg=stabilise_level_agg,
+            **kw_args,
+        )
+
+        self.density_channel_surf_vars = density_channel_surf_vars
+        self.angle_surf_vars = angle_surf_vars
+
+    def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        d = Aurora._adapt_checkpoint(self, d)
+        d = _adapt_checkpoint_wave(self.patch_size, d)
+        return d
+
+    def batch_transform_hook(self, batch: Batch) -> Batch:
+        #  Below we mutate `batch`, so make a copy here.
+        batch = dataclasses.replace(batch, surf_vars=dict(batch.surf_vars))
+
+        # It is important that these components are split off _before_ normalisation, as they
+        # have specific normalisation statistics.
+        if "dwi" in batch.surf_vars and "wind" in batch.surf_vars:
+            # Split into u-component and v-component.
+            u_wave = -batch.surf_vars["wind"] * torch.sin(torch.deg2rad(batch.surf_vars["dwi"]))
+            v_wave = -batch.surf_vars["wind"] * torch.cos(torch.deg2rad(batch.surf_vars["dwi"]))
+
+            # Update batch and remove `dwi`.
+            batch.surf_vars["10u_wave"] = u_wave
+            batch.surf_vars["10v_wave"] = v_wave
+            del batch.surf_vars["dwi"]
+
+        # If the magnitude of a wave is zero (or practically zero), it is absent, so indicate that
+        # with NaNs. Only do this when data is given to the model and not when it is rolled out.
+        if batch.metadata.rollout_step == 0:
+            for name_sh, other_wave_components in [
+                ("swh", ("mwd", "mwp", "pp1d")),
+                ("shww", ("mdww", "mpww")),
+                ("shts", ("mdts", "mdts")),
+                ("swh1", ("mwd1", "mwp1")),
+                ("swh2", ("mwd2", "mwp2")),
+            ]:
+                mask = batch.surf_vars[name_sh] < 1e-4
+                if mask.sum() > 0:
+                    for name in (name_sh,) + other_wave_components:
+                        x = batch.surf_vars[name].clone()  # Clone to safely mutate.
+                        x[mask] = np.nan
+                        batch.surf_vars[name] = x
+                        # There should be no small values left, except for in wave directions.
+                        if name not in {"mwd", "mdww", "mdts", "mwd1", "mwd2"}:
+                            assert (batch.surf_vars[name] < 1e-4).sum() == 0
+
+        return batch
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        for name in list(batch.surf_vars):
+            x = batch.surf_vars[name]
+
+            # Create a density channel.
+            if name in self.density_channel_surf_vars and f"{name}_density" not in batch.surf_vars:
+                batch.surf_vars[f"{name}_density"] = (~torch.isnan(x)).float()
+                batch.surf_vars[name] = x.nan_to_num(0)
+
+            # Add sine and cosine values of the angle and remove the original angle variable
+            sin_cos_present = f"{name}_sin" in batch.surf_vars and f"{name}_cos" in batch.surf_vars
+            if name in self.angle_surf_vars and not sin_cos_present:
+                batch.surf_vars[f"{name}_sin"] = torch.sin(torch.deg2rad(x)).nan_to_num(0)
+                batch.surf_vars[f"{name}_cos"] = torch.cos(torch.deg2rad(x)).nan_to_num(0)
+                del batch.surf_vars[name]
+
+        return batch
+
+    def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
+        wmb_mask = pred.static_vars["wmb"] > 0
+
+        # Undo the sine and cosine components.
+        for name in self.angle_surf_vars:
+            if f"{name}_sin" in pred.surf_vars and f"{name}_cos" in pred.surf_vars:
+                sin = pred.surf_vars[f"{name}_sin"]
+                cos = pred.surf_vars[f"{name}_cos"]
+                pred.surf_vars[name] = torch.rad2deg(torch.atan2(sin, cos)) % 360
+                del pred.surf_vars[f"{name}_sin"]
+                del pred.surf_vars[f"{name}_cos"]
+
+        # Undo the density channels. First transform by a sigmoid to get the actual value of the
+        # density channel.
+        for name in self.density_channel_surf_vars:
+            if name in pred.surf_vars:
+                density = torch.sigmoid(pred.surf_vars[f"{name}_density"]) * wmb_mask
+                data = pred.surf_vars[name] * wmb_mask
+                data[density < 0.5] = np.nan
+                pred.surf_vars[name] = data
+                del pred.surf_vars[f"{name}_density"]
+
+        return pred
