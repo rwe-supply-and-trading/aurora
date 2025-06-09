@@ -181,22 +181,23 @@ class Aurora(torch.nn.Module):
         self.use_lora = use_lora
         self.positive_surf_vars = positive_surf_vars
         self.positive_atmos_vars = positive_atmos_vars
-        
+
         if self.normalise:
-            # note that British English is used throughout the repo so we are being consistent in our mods
+            # note that British English is used throughout the repo so we are being consistent
             warnings.warn(
-                "The model is normalising batches. If you do not want this to occur, set normalise to "
-                "False at model instantiation.",
+                "The model is normalising batches. If you do not want this to occur, set normalise"
+                " to False at model instantiation.",
                 stacklevel=2,
             )
-        else: 
+        else:
             # only warning here for backwards compatibility
             warnings.warn(
-                "The model is not normalising batches because normalise is set to False at model instantiation. " \
+                "The model is not normalising batches because normalise is set to False at "
+                "model instantiation. "
                 "If you are not normalising outside of the model, check your model settings.",
                 stacklevel=2,
             )
-            
+
         if self.surf_stats and self.normalise:
             warnings.warn(
                 f"The normalisation statics for the following surface-level variables are manually "
@@ -276,7 +277,7 @@ class Aurora(torch.nn.Module):
 
         if self.normalise:
             batch = batch.normalise(surf_stats=self.surf_stats)
-        
+
         batch = batch.crop(patch_size=self.patch_size)
         batch = batch.to(p.device)
 

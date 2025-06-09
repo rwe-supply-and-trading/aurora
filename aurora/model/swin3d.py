@@ -458,7 +458,7 @@ class Swin3DTransformerBlock(nn.Module):
         """
         C, H, W = res
         B, L, D = x.shape
-        assert L == C * H * W, f"Wrong feature size: {L} vs {C}x{H}x{W}={C*H*W}"
+        assert L == C * H * W, f"Wrong feature size: {L} vs {C}x{H}x{W}={C * H * W}"
 
         # If the window size is larger than the input resolution, we do not partition windows.
         ws, ss = maybe_adjust_windows(self.window_size, self.shift_size, res)
@@ -525,7 +525,7 @@ class PatchMerging3D(nn.Module):
     def _merge(self, x: torch.Tensor, res: tuple[int, int, int]) -> torch.Tensor:
         C, H, W = res
         B, L, D = x.shape
-        assert L == C * H * W, f"Wrong feature size: {L} vs {C}*{H}*{W}={C*H*W}."
+        assert L == C * H * W, f"Wrong feature size: {L} vs {C}*{H}*{W}={C * H * W}."
         assert H > 1, f"Height ({H}) must be larger than 1."
         assert W > 1, f"Width ({W}) must be larger than 1."
 
@@ -578,7 +578,7 @@ class PatchSplitting3D(nn.Module):
     ) -> torch.Tensor:
         C, H, W = res
         B, L, D = x.shape
-        assert L == C * H * W, f"Wrong number of tokens: {L} != {C}*{H}*{W}={C*H*W}."
+        assert L == C * H * W, f"Wrong number of tokens: {L} != {C}*{H}*{W}={C * H * W}."
         assert D % 4 == 0, f"Number of input features ({D}) is not a multiple of 4."
 
         x = x.view(B, C, H, W, 2, 2, D // 4)
