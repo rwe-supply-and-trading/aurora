@@ -869,3 +869,93 @@ class AuroraWave(Aurora):
                 del pred.surf_vars[f"{name}_density"]
 
         return pred
+
+
+class AuroraS2S(Aurora):
+    """Version of Aurora that will be fine-tuned to S2S forecasting."""
+
+    default_checkpoint_name = "aurora-0.25-s2s.ckpt"
+
+    def __init__(
+        self,
+        *,
+        surf_vars: tuple[str, ...] = (
+            ("2t", "10u", "10v", "msl") + ("swvl1", "swvl2", "swvl3", "swvl4", "sst", "ci")
+        ),
+        static_vars: tuple[str, ...] = ("lsm", "z", "slt"),
+        # TO-DO: check on LoRAMode (single in OG Aurora class)
+        lora_mode: LoRAMode = "from_second",
+        stabilise_level_agg: bool = True,
+        density_channel_surf_vars: tuple[str, ...] = (
+            ("swvl1", "swvl2", "swvl3", "swvl4", "sst", "ci")
+        ),
+        **kw_args,
+    ) -> None:
+        # Model the density of the variables to account for land/ocean masks
+        supplemented_surf_vars: tuple[str, ...] = ()
+        for name in surf_vars:
+            if name in density_channel_surf_vars:
+                supplemented_surf_vars += (f"{name}_density",)
+
+        super().__init__(
+            surf_vars=supplemented_surf_vars,
+            static_vars=static_vars,
+            lora_mode=lora_mode,
+            stabilise_level_agg=stabilise_level_agg,
+            **kw_args,
+        )
+
+        self.density_channel_surf_vars = density_channel_surf_vars
+
+    def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        d = Aurora._adapt_checkpoint(self, d)
+        d = _adapt_checkpoint_wave(self.patch_size, d)
+        return d
+
+    def batch_transform_hook(self, batch: Batch) -> Batch:
+        #  Below we mutate `batch`, so make a copy here.
+        batch = dataclasses.replace(batch, surf_vars=dict(batch.surf_vars))
+
+        # if the fractional sea ice cover is zero, or practically zero, it is absent, so
+        # indicate that with NaNs. Only do this when data is given to the model and
+        # not when it is rolled out. Borrowed from the AuroraWave model.
+        if batch.metadata.rollout_step == 0:
+            # check if fractional sea ice cover is zero or practically zero
+            mask = batch.surf_vars["ci"] < 1e-4
+            if mask.sum() > 0:
+                x = batch.surf_vars["ci"].clone()  # Clone to safely mutate.
+                x[mask] = np.nan
+                batch.surf_vars["ci"] = x
+                # There should be no small values left.
+                assert (batch.surf_vars["ci"] < 1e-4).sum() == 0
+
+        return batch
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        for name in list(batch.surf_vars):
+            x = batch.surf_vars[name]
+
+            # Create a density channel.
+            if name in self.density_channel_surf_vars and f"{name}_density" not in batch.surf_vars:
+                batch.surf_vars[f"{name}_density"] = (~torch.isnan(x)).float()
+                batch.surf_vars[name] = x.nan_to_num(0)
+
+            # For the S2S model, we do not need to transform any angles, so we skip that step.
+
+        return batch
+
+    def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
+        # TO-DO: figure out what this wmb mask is!
+        wmb_mask = pred.static_vars["wmb"] > 0
+
+        # Undo the density channels. First transform by a sigmoid to get the actual value of the
+        # density channel.
+        for name in self.density_channel_surf_vars:
+            if name in pred.surf_vars:
+                density = torch.sigmoid(pred.surf_vars[f"{name}_density"]) * wmb_mask
+                data = pred.surf_vars[name] * wmb_mask
+                data[density < 0.5] = np.nan
+                pred.surf_vars[name] = data
+                del pred.surf_vars[f"{name}_density"]
+
+        return pred
