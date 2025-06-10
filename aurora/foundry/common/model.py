@@ -138,6 +138,16 @@ class AuroraWave(Model):
         return model
 
 
+class AuroraS2S(Model):
+    name = "aurora-0.25-s2s"
+    """str: Name of the model."""
+
+    def create_model(self) -> aurora.Aurora:
+        model = aurora.AuroraS2S()
+        model.load_checkpoint_local(MLFLOW_ARTIFACTS[self.name])
+        return model
+
+
 models: dict[str, type[Model]] = {}
 """dict[str, type[Model]]: A dictionary that lists all available models by their name."""
 
