@@ -1,13 +1,15 @@
 try:
     import kafou_arraylake as arraylake
 except ImportError:
-    import arraylake
+    pass
 
 import datetime
 
-import xarray as xr
 import numpy as np
+import pandas as pd
+import polars as pl
 import torch
+import xarray as xr
 
 from aurora import Batch, Metadata
 
@@ -164,3 +166,78 @@ class ERA5DataLoaderFOAM:
     def __iter__(self):
         for i in range(len(self.sample_ds.time) - 1):
             yield self[i]
+
+
+class FOAMDataset(torch.utils.data.Dataset):
+    def __init__(self, df: pd.DataFrame | pl.DataFrame, *, lv_repo_name: str = "kafou/aurora-era5-t1-latent-vectors", client: arraylake.Client | None = None):
+        self.target_ds = self.df_to_targets(df)
+
+        if client is None:
+            client = arraylake.Client()
+            if not lv_repo_name.startswith("kafou/"):
+                client.login()
+
+        repo = client.get_repo(lv_repo_name)
+        session = repo.readonly_session("main")
+
+        lv_ds = xr.open_zarr(session.store, zarr_format=3, consolidated=False, chunks=None)
+        if "valid_time_range" in lv_ds.attrs:
+            start_time, end_time = lv_ds.attrs["valid_time_range"]
+            lv_ds = lv_ds.sel(time=slice(start_time, end_time))
+        self.lv_ds = lv_ds
+
+        self.time_index = sorted(set(self.target_ds.time.to_numpy()) & set(self.lv_ds.time.to_numpy()))
+
+    def __getitem__(self, item: int | datetime.datetime | np.datetime64):
+        if isinstance(item, datetime.datetime):
+            item = np.datetime64(item)
+
+        if isinstance(item, np.datetime64):
+            time = item.astype('datetime64[ns]')
+
+            if time not in self.time_index:
+                raise KeyError(f"Invalid time index: {item!r}")
+
+            time = item
+        elif isinstance(item, int):
+            time = self.time_index[item]
+        else:
+            raise KeyError(f"Invalid key: {item!r}")
+
+        lv = self.lv_ds.sel(time=time).lv.to_numpy()
+        target = self.target_ds.sel(time=time).target.to_numpy()
+
+        return torch.from_numpy(lv), torch.from_numpy(target)
+
+    def __len__(self) -> int:
+        return len(self.time_index)
+
+    @staticmethod
+    def df_to_targets(df: pd.DataFrame | pl.DataFrame):
+        """
+        Take a Pandas or Polars DataFrame and convert it to an xarray dataset of target samples,
+        dropping any duplicate timestamps that might be present.
+
+        Args:
+            df: Pandas or Polars DataFrame
+
+        Returns:
+            An xarray dataset of target samples
+        """
+
+        if isinstance(df, pd.DataFrame):
+            ds = df.to_xarray()
+        elif isinstance(df, pl.DataFrame):
+            coords = {"time": df["time"].to_numpy()}
+            data_vars = {x.name: xr.DataArray(x.to_numpy(), dims=("time",)) for x in df if x.name != "time"}
+            ds = xr.Dataset(data_vars=data_vars, coords=coords)
+        else:
+            raise ValueError("df must be a polars or pandas DataFrame")
+
+        arrays = [ds[x].to_numpy().astype(np.float32).reshape(len(ds[x]), 1) for x in sorted(ds.data_vars)]
+        target = np.concat(arrays, axis=1)
+        ds = xr.Dataset(
+            {"target": xr.DataArray(target, dims=("time", "sample"), coords={"time": ds.time})},
+            coords={"time": ds.time},
+        )
+        return ds.drop_duplicates(dim="time")
