@@ -1,6 +1,8 @@
 """
+USAGE EXAMPLE (run once with --init, then append with --no-init):
+
 tmux
-codna activate aurora
+conda activate aurora
 srun --ntasks=1 --cpus-per-task=16 --gpus=0 --mem=300G --pty /bin/bash
 
 python channelize.py \
@@ -13,10 +15,15 @@ python channelize.py \
     --dst-branch testing \
     --token $ARRAYLAKE_TOKEN
 
+IMPORTANT OPERATIONAL CONTRACT:
+- --init MUST be run exactly once per destination repo/branch
+- Subsequent runs MUST use --no-init
+- Appending assumes new timestamps are >= last written timestamp
 """
 
 import datetime
 import time
+
 import click
 import kafou_arraylake as arraylake
 import numpy as np
@@ -60,22 +67,34 @@ def day_bounds(ts: datetime.datetime) -> tuple[np.datetime64, np.datetime64]:
     return d0, d1
 
 
-def get_day_batches(start: datetime.datetime, end: datetime.datetime, days_at_once: int):
+def get_day_batches(start_time: datetime.datetime, end_time: datetime.datetime, days_at_once: int):
     """
     Yield batches of consecutive days, each up to `days_at_once` in length.
     Always inclusive of endpoints.
     """
     one_day = datetime.timedelta(days=1)
-    cursor = start
+    cursor = start_time
 
-    while cursor <= end:
-        batch_end = min(cursor + one_day * (days_at_once - 1), end)
+    while cursor <= end_time:
+        batch_end = min(cursor + one_day * (days_at_once - 1), end_time)
         batch = [cursor + i * one_day for i in range((batch_end - cursor).days + 1)]
         yield batch
         cursor = batch_end + one_day
 
 
 def get_variable_locations(n_pressure_levels: int):
+    """
+    Compute channel index layout for surface + pressure-level variables.
+
+    Returns:
+      in_locs  : mapping from raw variable name → (channel_index, size)
+      out_locs : mapping from canonical name → (channel_index, size)
+
+    Channel layout is:
+      [ sfc vars | pl(var1 @ all levels) | pl(var2 @ all levels) | ... ]
+
+    This layout MUST match init_store() and NEVER change.
+    """
     in_locs = {"sfc": {}, "pl": {}}
     out_locs = {"sfc": {}, "pl": {}}
 
@@ -101,6 +120,18 @@ def process_day_from_datasets(
     sfc_ds: xr.Dataset,
     pl_ds: xr.Dataset,
 ):
+    """
+    Process exactly ONE calendar day and write its 4 timesteps.
+
+    This function:
+      - loads ONLY one day's worth of data
+      - builds a dense (time, channel, lat, lon) block
+      - region-writes into an EXISTING Zarr store
+
+    SAFE FOR APPENDS:
+      - assumes schema already exists
+      - relies on ensure_time_in_arrays() for time extension
+    """
     print(f"\n=== PROCESSING {timestamp:%Y-%m-%d} ===")
 
     # 1) Slice day: 00Z → 18Z
@@ -123,6 +154,8 @@ def process_day_from_datasets(
 
     new_times = sfc_day.time.values
 
+    # Ensure the destination store has capacity for these timestamps.
+    # This EXTENDS the time dimension if needed.
     ensure_time_in_arrays(
         store,
         timestamp=new_times[-1],  # last timestamp we will write
@@ -139,16 +172,20 @@ def process_day_from_datasets(
     X = int(sfc_day.longitude.size)
     n_channels = len(NAME_MAP["sfc"]) + (len(NAME_MAP["pl"]) * n_levels)
 
+    # Preallocate dense block for this day
     block = np.zeros((T, n_channels, Y, X), dtype=np.float32)
 
+    # Fill surface channels
     for varname, (cidx, _) in in_locs["sfc"].items():
         block[:, cidx, :, :] = sfc_day[varname].values
 
+    # Fill pressure-level channels (flattened over levels)
     for varname, (cidx, size) in in_locs["pl"].items():
         v = pl_day[varname].values  # (time, level, lat, lon)
         block[:, cidx : cidx + size, :, :] = v
 
-    # 3) Build dataset to write (ONLY sample_data)
+    # 3) Build dataset containing ONLY the variable we intend to write
+    # Coordinates MUST match the destination schema.
     write_ds = xr.Dataset(
         {
             "sample_data": (
@@ -165,6 +202,10 @@ def process_day_from_datasets(
     )
 
     # 4) Region write by coordinate labels
+    # IMPORTANT:
+    # - mode="a" → append / overwrite existing regions
+    # - region="auto" → xarray resolves correct indices from time coords
+    # - If timestamps already exist, THIS OVERWRITES THEM (by design)
     write_ds.to_zarr(
         store,
         group="samples",
@@ -178,8 +219,6 @@ def process_day_from_datasets(
 
 
 # BATCHED INGEST
-
-
 def open_src_datasets(
     *,
     src_repo: str,
@@ -187,7 +226,7 @@ def open_src_datasets(
     token: str | None = None,
 ):
     """
-    Grabs the base datasets from the source repo.
+    Grabs the base datasets from the source repo. Assumes either ERA5 or ECMWF ENFO format.
     """
     client = arraylake.Client(token=token)
     if token is None:
@@ -274,8 +313,10 @@ def open_src_datasets(
     return sfc_ds, pl_ds, inv_ds
 
 
-def parallel_reorg(
+def sequential_reorg(
     *,
+    sfc_ds,
+    pl_ds,
     src_repo_name,
     dst_repo_name,
     start_time,
@@ -285,27 +326,29 @@ def parallel_reorg(
     token=None,
     days_at_once=14,
 ):
+    # Initialize Arraylake client
     client = arraylake.Client(token=token)
     if token is None:
         client.login()
 
-    sfc_ds, pl_ds, inv_ds = open_src_datasets(
-        src_repo=src_repo_name,
-        src_branch=src_branch,
-        token=token,
-    )
-
+    # Open destination repo
     dst_repo = client.get_repo(dst_repo_name)
 
-    last_committed_day = None  # TRACK THIS
+    # Track last successfully committed day
+    last_committed_day = None
 
-    batches = get_day_batches(start_time, end_time, days_at_once)
+    # Process days in batches ex. 14 days at a time would be 14 batches
+    batches = get_day_batches(start_time=start_time, end_time=end_time, days_at_once=days_at_once)
+
+    # for each batch ...
     for batch in batches:
         print(f"\n▶️  BATCH {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}")
         t0 = time.monotonic()
 
+        # Get fresh writable session for each batch
         dst_session = dst_repo.writable_session(dst_branch)
 
+        # Try to process each day in the batch
         try:
             for day in batch:
                 process_day_from_datasets(
@@ -317,11 +360,12 @@ def parallel_reorg(
 
             commit_msg = f"Added batch {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}"
 
+            # Add retry logic. Sometimes icechunk repo has
             for attempt in range(1, 7):
                 try:
                     cid = dst_session.commit(commit_msg)
                     print(f"   COMMIT SUCCESS — {cid}")
-                    last_committed_day = batch[-1].date()  # UPDATE HERE
+                    last_committed_day = batch[-1].date()
                     break
                 except Exception as e:
                     print(f"   Commit attempt #{attempt} failed: {e}")
@@ -331,6 +375,8 @@ def parallel_reorg(
 
             print(f"   ⏱ Batch completed in {time.monotonic() - t0:.2f}s")
 
+        # If any day in the batch fails, exit the entire process,
+        # reporting the last successful day processed
         except Exception as e:
             print("\n   Batch failure:", e)
             if last_committed_day is not None:
@@ -374,17 +420,10 @@ def init_store(
     # Invariant fields
     # ------------------------------------------------------------------
     print("  • Writing 'invariant' group...")
-    (
-        inv_ds[["Z", "LSM", "SLT"]]
-        .rename(NAME_MAP["inv"])
-        .to_zarr(
-            store,
-            group="invariant",
-            zarr_format=3,
-            consolidated=False,
-            mode="w",
-        )
-    )
+    # Select just the invariant variables we want and rename them appropriately.
+    inv_ds = inv_ds[["Z", "LSM", "SLT"]]
+    inv_ds = inv_ds.rename(NAME_MAP["inv"])
+    inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False)
 
     # ------------------------------------------------------------------
     # Schema derivation
@@ -495,24 +534,21 @@ def main(
       --no-init  for subsequent appends between start_time and end_time
     """
 
-    # To initialize the dst repo
+    # Initialize Arraylake client
+    client = arraylake.Client(token=token)
+    if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
+        client.login()
+
+    # Open source datasets
+    sfc_ds, pl_ds, inv_ds = open_src_datasets(
+        src_repo=src_repo,
+        src_branch=src_branch,
+        token=token,
+    )
+
+    # Initialize the dst repo
     if init:
-        client = arraylake.Client(token=token)
-
-        # Initialization path: create dst repo and layout
-        if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
-            print("Logging in to Arraylake for init...")
-            client.login()
-
-        sfc_ds, pl_ds, inv_ds = open_src_datasets(
-            src_repo=src_repo,
-            src_branch=src_branch,
-            token=token,
-        )
-
-        print(f"Creating destination repo: {dst_repo}")
-
-        # Create or open existing repo
+        # If the repo already exists, open it instead of creating a new repo
         try:
             dst_repo_obj = client.create_repo(dst_repo)
             print(f"✓ Created new repo: {dst_repo}")
@@ -520,11 +556,8 @@ def main(
             print(f"Repo already exists; opening existing repo: {dst_repo}")
             dst_repo_obj = client.get_repo(dst_repo)
 
-        # ---------------------------------------------------------
         # Ensure the destination branch exists
-        # ---------------------------------------------------------
         branches = dst_repo_obj.list_branches()
-
         if dst_branch not in branches:
             print(f"Branch '{dst_branch}' does not exist — creating from 'main'...")
             main_id = dst_repo_obj.lookup_branch("main")
@@ -542,8 +575,10 @@ def main(
         print(f"Initialized; commit_id={commit_id}")
         return
 
-    # otherwise, we want to fill it with data
-    parallel_reorg(
+    # Otherwise, we want to fill it with data
+    sequential_reorg(
+        sfc_ds=sfc_ds,
+        pl_ds=pl_ds,
         src_repo_name=src_repo,
         dst_repo_name=dst_repo,
         start_time=start_time,
