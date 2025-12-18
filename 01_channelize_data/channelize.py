@@ -379,10 +379,14 @@ def sequential_reorg(
         # reporting the last successful day processed
         except Exception as e:
             print("\n   Batch failure:", e)
+
             if last_committed_day is not None:
-                print(f"   Last successfully written day: {last_committed_day:%Y-%m-%d}")
+                # 🔒 single source of truth for restart
+                print(f"RESTART_CURSOR={last_committed_day:%Y-%m-%d}")
+                print(f"   Last successfully COMMITTED day: {last_committed_day:%Y-%m-%d}")
             else:
-                print("   No days were successfully written.")
+                print("RESTART_CURSOR=NONE")
+                print("   No batches were successfully committed yet.")
 
             raise SystemExit(1)
 
