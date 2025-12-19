@@ -1,16 +1,15 @@
 import datetime
 import time
-from concurrent.futures import ProcessPoolExecutor
 
-import kafou_arraylake as arraylake
 import click
-import icechunk
+import kafou_arraylake as arraylake
 import numpy as np
 import xarray as xr
-import zarr
-import zarr.abc.store
+from dataset_io import ensure_time_in_arrays
 
-from icechunk.distributed import merge_sessions
+# ---------------------------------------------------------------------
+# VARIABLE MAP
+# ---------------------------------------------------------------------
 
 NAME_MAP = {
     "sfc": {
@@ -34,146 +33,168 @@ NAME_MAP = {
 }
 
 
-def open_src_datasets(session: icechunk.Session) -> tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
-    sfc_ds = xr.open_zarr(
-        session.store, group="surface", zarr_format=3, consolidated=False, chunks=None
-    )
-    pl_ds = xr.open_zarr(
-        session.store, group="pressure_level", zarr_format=3, consolidated=False, chunks=None
-    )
-    inv_ds = xr.open_zarr(
-        session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
-    )
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
 
-    return sfc_ds, pl_ds, inv_ds
+def day_bounds(ts: datetime.datetime):
+    """Return numpy datetime64 bounds for exactly D00Z → D18Z."""
+    d0 = np.datetime64(ts.date())                # YYYY-MM-DDT00:00:00
+    d1 = d0 + np.timedelta64(18, "h")            # D18Z
+    return d0, d1
 
 
-def get_variable_locations(n_pressure_levels: int = 13) -> tuple[dict, dict]:
+def get_day_batches(start, end, days_at_once):
+    cursor = start
+    one = datetime.timedelta(days=1)
+
+    while cursor <= end:
+        batch_end = min(cursor + one * (days_at_once - 1), end)
+        batch = []
+
+        d = cursor
+        while d <= batch_end:
+            batch.append(d)
+            d += one
+
+        yield batch
+        cursor = batch_end + one
+
+
+def get_variable_locations(n_pressure_levels: int):
     in_locs = {"sfc": {}, "pl": {}}
     out_locs = {"sfc": {}, "pl": {}}
 
-    i = 0
-    sfc_map = NAME_MAP["sfc"]
-    for var in sfc_map:
-        loc = (i, 1)
-        in_locs["sfc"][var] = loc
-        out_locs["sfc"][sfc_map[var]] = loc
-        i += 1
+    idx = 0
 
-    pl_map = NAME_MAP["pl"]
-    for var in pl_map:
-        loc = (i, n_pressure_levels)
-        in_locs["pl"][var] = loc
-        out_locs["pl"][pl_map[var]] = loc
-        i += n_pressure_levels
+    for var in NAME_MAP["sfc"]:
+        in_locs["sfc"][var] = (idx, 1)
+        out_locs["sfc"][NAME_MAP["sfc"][var]] = (idx, 1)
+        idx += 1
+
+    for var in NAME_MAP["pl"]:
+        in_locs["pl"][var] = (idx, n_pressure_levels)
+        out_locs["pl"][NAME_MAP["pl"][var]] = (idx, n_pressure_levels)
+        idx += n_pressure_levels
 
     return in_locs, out_locs
 
 
-def init_store(
-    store: zarr.abc.store.Store, *, sfc_ds: xr.Dataset, pl_ds: xr.Dataset, inv_ds: xr.Dataset
-):
+# ---------------------------------------------------------------------
+# IDEMPOTENCY CHECK
+# ---------------------------------------------------------------------
+
+def day_already_written(store, day):
     """
-    Initialize a zarr storage based upon our input datasets.
+    Return True if all 4 timestamps for the given day already exist in Zarr.
     """
+    ds = xr.open_zarr(store, group="samples", zarr_format=3, consolidated=False)
 
-    # Select just the invariant variables we want and rename them appropriately.
-    inv_ds = inv_ds[["Z", "LSM", "SLT"]]
-    inv_ds = inv_ds.rename(NAME_MAP["inv"])
-    inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False)
+    d0, d1 = day_bounds(day)
+    existing = ds.time.sel(time=slice(d0, d1))
 
-    # Use xarray to create coordinates.
-    _, out_var_locs = get_variable_locations(len(pl_ds.level))
-    coords_ds = xr.Dataset(
-        data_vars={
-            "atmos_levels": [int(x) for x in pl_ds.level]
-        },
-        coords={
-            "time": sfc_ds.time,
-            "latitude": sfc_ds.latitude,
-            "longitude": sfc_ds.longitude,
-        },
-        attrs={
-            "var_locs": out_var_locs,
-        },
-    )
-    coords_ds.to_zarr(
-        store,
-        group="samples",
-        zarr_format=3,
-        consolidated=False,
-        encoding={
-            "time": {"chunks": (len(sfc_ds.time),)},
-            "latitude": {"chunks": (len(sfc_ds.latitude),)},
-            "longitude": {"chunks": (len(sfc_ds.longitude),)},
-            "atmos_levels": {"chunks": (len(coords_ds.atmos_levels),)},
-        },
-    )
+    # ERA5 should have D00Z, D06Z, D12Z, D18Z → 4 records
+    return existing.size == 4
 
-    # Finally, use zarr to add an additional sparse data array which will be filled later.
-    group = zarr.open_group(store, path="samples", mode="a")
-    compressors = [zarr.codecs.BloscCodec(clevel=3, shuffle=zarr.codecs.BloscShuffle.bitshuffle)]
-    channels = len(NAME_MAP["sfc"]) + (len(NAME_MAP["pl"]) * len(coords_ds.atmos_levels))
-    group.create_array(
-        "sample_data",
-        shape=(len(sfc_ds.time), channels, len(sfc_ds.latitude), len(sfc_ds.longitude)),
-        chunks=(1, channels, 103, 72),
-        dtype="float32",
-        dimension_names=("time", "channel", "latitude", "longitude"),
-        fill_value=np.nan,
-        compressors=compressors,
-    )
 
+# ---------------------------------------------------------------------
+# MAIN PER-DAY INGEST FUNCTION
+# ---------------------------------------------------------------------
 
 def process_day_from_datasets(
     *,
-    store: zarr.abc.store.Store,
+    store,
     timestamp: datetime.datetime,
     sfc_ds: xr.Dataset,
     pl_ds: xr.Dataset,
 ):
-    time_selector = timestamp.strftime("%Y-%m-%d")
+    # IDEMPOTENCY — skip day if already written
+    if day_already_written(store, timestamp):
+        print(f"   ✔ Day {timestamp:%Y-%m-%d} already written — skipping.")
+        return 0
 
-    in_locs, _ = get_variable_locations(len(pl_ds.level))
-    sfc_vars = list(in_locs["sfc"])
-    pl_vars = list(in_locs["pl"])
+    print(f"\n=== PROCESSING {timestamp:%Y-%m-%d} ===")
 
-    # Load all data for the vars we care about all at once as a performance improvement.
-    sfc_ds = sfc_ds[sfc_vars].sel(time=time_selector).compute()
-    pl_ds = pl_ds[pl_vars].sel(time=time_selector).compute()
+    # 1. Slice ERA5 correctly: D00Z → D18Z
+    d0, d1 = day_bounds(timestamp)
+    sfc_vars = list(NAME_MAP["sfc"])
+    pl_vars = list(NAME_MAP["pl"])
 
-    n_channels = len(NAME_MAP["sfc"]) + (len(NAME_MAP["pl"]) * len(pl_ds.level))
+    sfc_day = sfc_ds[sfc_vars].sel(time=slice(d0, d1)).compute()
+    pl_day = pl_ds[pl_vars].sel(time=slice(d0, d1)).compute()
 
-    sample_data = np.zeros(
-        (len(sfc_ds.time), n_channels, len(sfc_ds.latitude), len(sfc_ds.longitude)),
-        dtype=np.float32,
+    if sfc_day.time.size != 4:
+        raise RuntimeError(
+            f"Expected 4 timesteps for {timestamp:%Y-%m-%d}, got {sfc_day.time.size}"
+        )
+
+    # 2. Determine channels
+    n_levels = pl_day.level.size
+    in_locs, _ = get_variable_locations(n_levels)
+
+    T = 4
+    Y = sfc_day.latitude.size
+    X = sfc_day.longitude.size
+    n_channels = len(NAME_MAP["sfc"]) + len(NAME_MAP["pl"]) * n_levels
+
+    block = np.zeros((T, n_channels, Y, X), dtype=np.float32)
+
+    # 3. Fill block
+    for ti in range(T):
+        for varname, (cidx, _) in in_locs["sfc"].items():
+            block[ti, cidx] = sfc_day[varname].isel(time=ti).values
+
+        for varname, (cidx, size) in in_locs["pl"].items():
+            block[ti, cidx:cidx+size] = pl_day[varname].isel(time=ti).values
+
+    new_times = sfc_day.time.values
+
+    # 4. Ensure timestamps exist in Zarr arrays
+    ensure_time_in_arrays(
+        store,
+        timestamp=new_times[-1],
+        time_frequency="6h",
+        group="samples",
     )
 
-    for i in range(len(sfc_ds.time)):
-        for varname, (d_idx, size) in in_locs["sfc"].items():
-            sample_data[i, d_idx] = sfc_ds[varname][i]
-
-        for varname, (d_idx, size) in in_locs["pl"].items():
-            sample_data[i, d_idx : d_idx + size] = pl_ds[varname][i]
-
-    data_array = xr.DataArray(sample_data, dims=("time", "channel", "latitude", "longitude"))
-
-    ds = xr.Dataset(
-        {"sample_data": data_array},
-        coords={"time": sfc_ds.time, "latitude": sfc_ds.latitude, "longitude": sfc_ds.longitude},
+    # 5. Build dataset for region write
+    new_ds = xr.Dataset(
+        {"sample_data": (("time", "channel", "latitude", "longitude"), block)},
+        coords={
+            "time": new_times,
+            "channel": np.arange(n_channels),
+            "latitude": sfc_day.latitude.values,
+            "longitude": sfc_day.longitude.values,
+            "atmos_levels": pl_day.level.values,
+        },
     )
-    ds.to_zarr(store, group="samples", zarr_format=3, consolidated=False, region="auto")
 
-    return ds
+    new_ds.to_zarr(
+        store,
+        group="samples",
+        region="auto",
+        mode="a",
+        consolidated=False,
+    )
+
+    print(f"   ✔ Finished writing day {timestamp:%Y-%m-%d}")
+    return T
 
 
-def process_day_from_repo(
+# ---------------------------------------------------------------------
+# BATCHED INGEST + IDEMPOTENT COMMIT
+# ---------------------------------------------------------------------
+
+def parallel_reorg(
     *,
-    timestamp: datetime.datetime,
-    src_repo_name: str,
-    session: icechunk.Session,
-    src_branch: str = "main",
-    token: str | None = None,
+    src_repo_name,
+    dst_repo_name,
+    start_time,
+    end_time,
+    src_branch="main",
+    dst_branch="main",
+    token=None,
+    days_at_once=14,
 ):
     client = arraylake.Client(token=token)
     if token is None:
@@ -181,77 +202,55 @@ def process_day_from_repo(
 
     src_repo = client.get_repo(src_repo_name)
     src_session = src_repo.readonly_session(src_branch)
-    sfc_ds = xr.open_zarr(
-        src_session.store, group="surface", zarr_format=3, consolidated=False, chunks=None
-    )
-    pl_ds = xr.open_zarr(
-        src_session.store, group="pressure_level", zarr_format=3, consolidated=False, chunks=None
-    )
-    process_day_from_datasets(store=session.store, timestamp=timestamp, sfc_ds=sfc_ds, pl_ds=pl_ds)
 
-    return session
-
-
-def parallel_reorg(
-    *,
-    src_repo_name: str,
-    dst_repo_name: str,
-    start_time: datetime.datetime,
-    end_time: datetime.datetime,
-    src_branch: str = "main",
-    dst_branch: str = "main",
-    token: str | None = None,
-    days_at_once: int = 30,
-    n_workers: int = 1,
-):
-    client = arraylake.Client(token=token)
-    if token is None and dst_repo_name.startswith("rwe/"):
-        client.login()
+    sfc_ds = xr.open_zarr(src_session.store, "surface", zarr_format=3, consolidated=False)
+    pl_ds  = xr.open_zarr(src_session.store, "pressure_level", zarr_format=3, consolidated=False)
 
     dst_repo = client.get_repo(dst_repo_name)
 
-    day_groups = []
-    i = 0
-    group = []
-    while start_time <= end_time:
-        if i == days_at_once:
-            day_groups.append(group)
-            group = []
-            i = 0
-        i += 1
-        group.append(start_time)
-        start_time += datetime.timedelta(days=1)
-    if group:
-        day_groups.append(group)
+    batches = get_day_batches(start_time, end_time, days_at_once)
 
-    for day_group in day_groups:
+    for batch in batches:
+        print(f"\n▶️  BATCH {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}")
+        t0 = time.monotonic()
+
+        dst_session = dst_repo.writable_session(dst_branch)
+
         try:
-            p_start = time.monotonic()
-            print(f"Processing {day_group[0]:%Y-%m-%d} to {day_group[-1]:%Y-%m-%d}")
-            session = dst_repo.writable_session(dst_branch)
+            # ingest each day
+            for day in batch:
+                process_day_from_datasets(
+                    store=dst_session.store,
+                    timestamp=day,
+                    sfc_ds=sfc_ds,
+                    pl_ds=pl_ds,
+                )
 
-            with ProcessPoolExecutor(max_workers=n_workers, max_tasks_per_child=1) as executor:
-                with session.allow_pickling():
-                    futures = [
-                        executor.submit(
-                            process_day_from_repo,
-                            timestamp=x,
-                            src_repo_name=src_repo_name,
-                            session=session,
-                            src_branch=src_branch,
-                            token=token,
-                        )
-                        for x in day_group
-                    ]
-                    sessions = [f.result() for f in futures]
-            session = merge_sessions(session, *sessions)
-            session.commit(f"Added {day_group[0]:%Y-%m-%d} to {day_group[-1]:%Y-%m-%d}")
-            p_end = time.monotonic()
-            p_total = p_end - p_start
-            print(f"Took {p_total:0.2f} seconds")
-        except Exception:
-            print(f"FAILED: {day_group[0]:%Y-%m-%d} {day_group[-1]:%Y-%m-%d}")
+            # commit with retries
+            commit_msg = f"Added batch {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}"
 
+            for attempt in range(1, 7):
+                try:
+                    cid = dst_session.commit(commit_msg)
+                    print(f"   ✅ COMMIT SUCCESS — {cid}")
+                    break
+                except Exception as e:
+                    print(f"   ❌ Commit attempt #{attempt} failed: {e}")
+                    if attempt == 6:
+                        raise RuntimeError("Max commit retries reached.")
+                    time.sleep(2 ** attempt)
+
+            print(f"   ⏱ Batch completed in {time.monotonic() - t0:.2f}s")
+
+        except Exception as e:
+            print("\n   ❌ Batch failure:", e)
+            print(f"   ❌ Stopping at day {batch[0]:%Y-%m-%d}")
+            raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 
 @click.command()
 @click.argument("start_time", type=click.DateTime())
@@ -262,51 +261,7 @@ def parallel_reorg(
 @click.option("--dest-branch", default="main")
 @click.option("--token", default=None)
 @click.option("--days-at-once", type=int, default=14)
-@click.option("--n-workers", type=int, default=14)
-@click.option("--init/--no-init", default=False)
-def main(
-    start_time,
-    end_time,
-    src_repo,
-    dest_repo,
-    src_branch,
-    dest_branch,
-    token,
-    days_at_once,
-    n_workers,
-    init,
-):
-    if init:
-        client = arraylake.Client(token=token)
-        if token is None and (src_repo.startswith("rwe/") or dest_repo.startswith("rwe/")):
-            client.login()
-
-        src_repo = client.get_repo(src_repo)
-        src_session = src_repo.readonly_session(src_branch)
-
-        dest_repo = client.create_repo(dest_repo)
-        dest_session = dest_repo.writable_session(dest_branch)
-
-        inv_ds = xr.open_zarr(
-            src_session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
-        )
-        sfc_ds = xr.open_zarr(
-            src_session.store, group="surface", zarr_format=3, consolidated=False, chunks=None
-        )
-        pl_ds = xr.open_zarr(
-            src_session.store,
-            group="pressure_level",
-            zarr_format=3,
-            consolidated=False,
-            chunks=None,
-        )
-
-        init_store(dest_session.store, sfc_ds=sfc_ds, pl_ds=pl_ds, inv_ds=inv_ds)
-
-        commit_id = dest_session.commit("Initialized sample data store.")
-        print(f"Initialized; {commit_id=}")
-        return
-
+def main(start_time, end_time, src_repo, dest_repo, src_branch, dest_branch, token, days_at_once):
     parallel_reorg(
         src_repo_name=src_repo,
         dst_repo_name=dest_repo,
@@ -316,7 +271,6 @@ def main(
         dst_branch=dest_branch,
         token=token,
         days_at_once=days_at_once,
-        n_workers=n_workers,
     )
 
 
