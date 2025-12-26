@@ -74,39 +74,74 @@ from aurora import AuroraPretrained
 from aurora.data import ERA5DataLoaderFOAM
 
 
-def init_zarr_store(
-    *,
-    store: zarr.abc.store.Store,
-    sample_ds: xr.Dataset,
-) -> None:
+def init_zarr_store(*, store, n_init, n_lead, latent_dim, init_times, lead_times, valid_times):
     """
-    Initialize the destination Zarr store for Aurora latent vectors.
+    Initialize an EMPTY latent-forecast Zarr v3 store.
 
-    Creates:
-      - A time coordinate copied from the source samples dataset
-        (excluding the first timestep to align with t+6h semantics).
-      - A preallocated `lv` array with shape:
-            (time, spatial_location, feature)
-
-    This function defines the *structural contract* of the latent-vector
-    repository. It should be called exactly once at repository creation
-    time and never on an existing store.
+    - No compression
+    - No chunking
+    - No in-memory allocation of huge arrays
+    - Only metadata + empty array definition
     """
-    ds = xr.Dataset(coords={"time": sample_ds.time[1:]})
-    ds.to_zarr(
-        store, zarr_format=3, consolidated=False, encoding={"time": {"chunks": (len(ds.time),)}}
+
+    print("\n====================== INIT_ZARR_STORE ======================")
+    print("[DEBUG] n_init:", n_init)
+    print("[DEBUG] n_lead:", n_lead)
+    print("[DEBUG] latent_dim:", latent_dim)
+    print("[DEBUG] init_times (len):", len(init_times))
+    print("[DEBUG] lead_times (len):", len(lead_times))
+    print("[DEBUG] valid_times.shape:", valid_times.shape)
+
+    # ---- 1. Coordinate Dataset ----
+    print("\n[DEBUG] Building coordinate dataset...")
+    coord_ds = xr.Dataset(
+        coords={
+            "init_time": init_times,
+            "lead_time": lead_times,
+            "valid_time": (("init_time", "lead_time"), valid_times),
+        },
+        attrs={
+            "description": "Latent-space forecast dataset (initialized)",
+        },
     )
+    print("[DEBUG] coord_ds.dims:", coord_ds.dims)
+    print("[DEBUG] coord_ds.coords:", list(coord_ds.coords))
+
+    # ---- Write only coordinate metadata ----
+    print("\n[DEBUG] Writing coordinate dataset to Zarr...")
+    coord_ds.to_zarr(
+        store,
+        zarr_format=3,
+        mode="w",
+        consolidated=False,
+        write_empty_chunks=False,
+    )
+    print("[DEBUG] Coordinate dataset written.")
+
+    # ---- 2. Create empty array for latent_forecast ----
+    print("\n[DEBUG] Creating empty zarr array for latent_forecast...")
+    import zarr
+
+    print("[DEBUG] zarr.create_array parameters:")
+    print("        name        = latent_forecast")
+    print("        shape       =", (n_init, n_lead, latent_dim))
+    print("        dtype       = float32")
+    print("        fill_value  = NaN")
+    print("        dimension_names =", ("init_time", "lead_time", "lv"))
 
     zarr.create_array(
         store,
-        name="lv",
-        shape=(len(ds.time), 259200, 1024),
-        chunks=(1, 2025, 256),
-        dimension_names=("time", "spatial_location", "feature"),
-        compressors=[],
-        dtype=np.float32,
+        name="latent_forecast",
+        shape=(n_init, n_lead, latent_dim),
+        dtype="float32",
         fill_value=np.nan,
+        dimension_names=("init_time", "lead_time", "lv"),
     )
+
+    print("[DEBUG] latent_forecast array created (metadata only).")
+    print("==============================================================\n")
+
+    return coord_ds
 
 
 def write_metadata(
@@ -199,6 +234,42 @@ def get_job_count(lv_job_id: str, retries: int = 2, delay: int = 5) -> int:
     raise RuntimeError(f"squeue failed after {retries} retries: {last_err}")
 
 
+def reshape_rollout_to_cube(lv_ds: xr.Dataset, init_time: datetime.datetime):
+    print("\n[DEBUG][reshape_rollout_to_cube] lv_ds:")
+    print("  lv_ds.dims:", lv_ds.dims)
+    print("  lv_ds['lv'].shape:", lv_ds["lv"].shape)
+
+    times = lv_ds["time"].values
+    print("  raw times:", times)
+
+    lead_hours = ((times - np.datetime64(init_time)) / np.timedelta64(1, "h")).astype("int64")
+    print("  computed lead_hours:", lead_hours)
+
+    lv = lv_ds["lv"].values
+    print("  lv raw np.shape:", lv.shape)
+
+    lv_flat = lv.reshape(lv.shape[0], -1)
+    print("  lv_flat shape (steps × flattened):", lv_flat.shape)
+
+    ds = xr.Dataset(
+        coords={
+            "init_time": [np.datetime64(init_time)],
+            "lead_time": lead_hours,
+        },
+        data_vars={
+            "latent_forecast": (("init_time", "lead_time", "lv"), lv_flat[None, :, :]),
+        },
+    )
+
+    print("  cube dataset dims:", ds.dims)
+
+    valid_time = np.datetime64(init_time) + lead_hours * np.timedelta64(1, "h")
+    ds = ds.assign_coords(valid_time=(("init_time", "lead_time"), valid_time[None, :]))
+
+    print("[DEBUG][reshape_rollout_to_cube] final cube dims:", ds.dims)
+    return ds
+
+
 class LatentVectorExtractor:
     """
     Aurora inference wrapper for ERA5 latent-vector extraction.
@@ -221,11 +292,14 @@ class LatentVectorExtractor:
         source_repo: str,
         client: arraylake.Client | None = None,
     ):
+        print("\n[DEBUG][LVE.__init__] Loading repo:", source_repo)
+
         if client is None:
             client = arraylake.Client()
 
         repo = client.get_repo(source_repo)
         session = repo.readonly_session(source_branch)
+
         sample_ds = xr.open_zarr(
             session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
         )
@@ -268,6 +342,8 @@ def cli() -> None:
 
 
 @cli.command()
+@click.argument("start-time", type=click.DateTime())
+@click.argument("end-time", type=click.DateTime())
 @click.option("--src-repo", type=str, required=True, help="Source repository", show_default=True)
 @click.option(
     "--dest-repo",
@@ -282,11 +358,17 @@ def cli() -> None:
 @click.option(
     "--src-branch", type=str, default="main", help="Destination branch", show_default=True
 )
+@click.option(
+    "--rollout-steps", type=int, default=10, help="Number of lead times", show_default=True
+)
 def init(
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
     src_repo: str,
     dest_repo: str,
     dest_branch: str,
     src_branch: str,
+    rollout_steps: int,
 ) -> None:
     """
     Initialize a new latent-vector repository.
@@ -295,23 +377,55 @@ def init(
     initial Zarr layout, including the time coordinate and preallocated
     latent-vector array.
     """
-    dest_repo_name = dest_repo
-
     client = arraylake.Client()
 
-    src_repo = client.get_repo(src_repo)
-    src_session = src_repo.readonly_session(src_branch)
+    try:
+        dest_repo_obj = client.create_repo(dest_repo)
+    except Exception:
+        dest_repo_obj = client.get_repo(dest_repo)
 
-    dest_repo = client.create_repo(dest_repo)
-    dest_session = dest_repo.writable_session(dest_branch)
+    dest_session = dest_repo_obj.writable_session(dest_branch)
 
-    sample_ds = xr.open_zarr(
-        src_session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
+    # ----------------------------------------
+    # Time coordinate construction
+    # ----------------------------------------
+    init_times = pd.date_range(start_time, end_time, freq="6H")
+    n_init = len(init_times)
+
+    lead_times = pd.to_timedelta(np.arange(rollout_steps) * 6, unit="h")
+    n_lead = len(lead_times)
+
+    valid_times = np.array(init_times, dtype="datetime64[ns]")[:, None] + lead_times.values[None, :]
+
+    # ----------------------------------------
+    # Known Aurora latent dimension
+    # ----------------------------------------
+    latent_dim = 259200 * 1024
+
+    print("\n[DEBUG][init] init_times:", init_times)
+    print("[DEBUG] n_init:", n_init)
+    print("[DEBUG] lead_times:", lead_times)
+    print("[DEBUG] n_lead:", n_lead)
+    print("[DEBUG] valid_times.shape:", valid_times.shape)
+    print("[DEBUG] latent_dim:", latent_dim)
+
+    # ----------------------------------------
+    # Call lazy Zarr initializer
+    # ----------------------------------------
+    ds = init_zarr_store(
+        store=dest_session.store,
+        n_init=n_init,
+        n_lead=n_lead,
+        latent_dim=latent_dim,
+        init_times=init_times,
+        lead_times=lead_times,
+        valid_times=valid_times,
     )
 
-    init_zarr_store(store=dest_session.store, sample_ds=sample_ds)
-    commit_id = dest_session.commit("Initialized latent vector store.")
-    print(f"Initialized repo {dest_repo_name}: {commit_id}")
+    commit_id = dest_session.commit("Initialized latent forecast Zarr schema.")
+    print(f"[DEBUG] Zarr initialized and committed: {commit_id}")
+
+    return ds, dest_session
 
 
 @cli.command()
@@ -395,6 +509,7 @@ def save_lvs(
     # compute max time this job will write
     final_write_time = end_time + datetime.timedelta(hours=6)
 
+    # 🔒 ensure time axis ONCE
     ensure_time_in_arrays(
         dest_session.store,
         final_write_time,
