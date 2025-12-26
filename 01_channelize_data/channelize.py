@@ -122,7 +122,6 @@ def get_variable_locations(n_pressure_levels: int) -> tuple[dict, dict]:
     return in_locs, out_locs
 
 
-# BATCHED INGEST
 def open_src_datasets(
     *,
     src_repo: str,
@@ -270,7 +269,9 @@ def channelize_day(
                 )
                 raise
 
-            print(f"Read failed for {timestamp:%Y-%m-%d} (attempt {attempt}/{READ_RETRIES}): {e}")
+            print(
+                f"Read failed for {timestamp:%Y-%m-%d} (attempt {attempt}/{READ_RETRIES}):\n\n{e}"
+            )
 
     if sfc_day.time.size != 4:
         raise RuntimeError(
@@ -283,8 +284,7 @@ def channelize_day(
 
     new_times = sfc_day.time.values
 
-    # Ensure the destination store has capacity for these timestamps.
-    # This EXTENDS the time dimension if needed.
+    # Ensure the destination store has capacity for these timestamps, EXTENDING if needed.
     ensure_time_in_arrays(
         store,
         timestamp=new_times[-1],  # last timestamp we will write
@@ -329,6 +329,9 @@ def channelize_day(
         },
     )
 
+    existing = xr.open_zarr(store, group="samples", consolidated=False)
+    write_ds.attrs = dict(existing.attrs)
+
     # 4) Region write by coordinate labels
     # IMPORTANT:
     # - mode="a" → append / overwrite existing regions
@@ -362,9 +365,10 @@ def channelize_dataset(
         client.login()
 
     repo = client.get_repo(dst_repo)
-    last_committed: datetime.date | None = None
+    last_committed = None
 
-    for batch in get_day_batches(start_time, end_time, days_at_once):
+    batches = get_day_batches(start_time, end_time, days_at_once)
+    for batch in batches:
         start, end = batch[0], batch[-1]
         print(f"\n▶️  BATCH {start:%Y-%m-%d} → {end:%Y-%m-%d}")
         t0 = time.monotonic()
@@ -446,7 +450,7 @@ def init_store(
     # Select just the invariant variables we want and rename them appropriately.
     inv_ds = inv_ds[["Z", "LSM", "SLT"]]
     inv_ds = inv_ds.rename(NAME_MAP["inv"])
-    inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False)
+    inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False, mode="a")
 
     # Schema derivation
     time_coord = sfc_ds.time
@@ -530,7 +534,7 @@ def init_store(
 @click.option("--src-branch", default="main")
 @click.option("--dst-branch", default="main")
 @click.option("--token", default=None)
-@click.option("--days-at-once", type=int, default=14)
+@click.option("--days-at-once", type=int, default=2)
 @click.option("--init/--no-init", default=False)
 def main(
     start_time: datetime.datetime,
