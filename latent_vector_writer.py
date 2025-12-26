@@ -223,17 +223,32 @@ def cli():
     help="Repository to be created",
     show_default=True,
 )
-def init(src_repo, dest_repo):
-    """Initialize a new latent vector repository."""
+@click.option(
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
+)
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
+def init(
+    src_repo: str,
+    dest_repo: str,
+    dest_branch: str,
+    src_branch: str,
+) -> None:
+    """
+    Initialize a new latent-vector repository.
+
+    This command creates a destination repository and writes the
+    initial Zarr layout, including the time coordinate and preallocated
+    latent-vector array.
+    """
     dest_repo_name = dest_repo
 
     client = arraylake.Client()
 
     src_repo = client.get_repo(src_repo)
-    src_session = src_repo.readonly_session("main")
+    src_session = src_repo.readonly_session(src_branch)
 
     dest_repo = client.create_repo(dest_repo)
-    dest_session = dest_repo.writable_session("main")
+    dest_session = dest_repo.writable_session(dest_branch)
 
     sample_ds = xr.open_zarr(
         src_session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
