@@ -360,6 +360,25 @@ def channelize_dataset(
     token: str | None = None,
     days_at_once: int = 14,
 ) -> None:
+    """
+    Incrementally write channelized ERA5/ENFO data into an existing Arraylake
+    repository over a given date range.
+
+    Data is processed in contiguous day batches. Each batch is written using a
+    fresh writable session and committed atomically. Individual days are written
+    via region-based updates to `samples/sample_data` and are safe to overwrite.
+
+    On any failure, processing aborts immediately and prints
+    `RESTART_CURSOR=YYYY-MM-DD`, indicating the last successfully committed day
+    (or `RESTART_CURSOR=NONE` if no commits occurred). Restart by setting
+    `start_time` to the next day.
+
+    Requirements:
+      - Destination repo/branch and schema must already exist (`--init` run once).
+      - Appends only; new timestamps must be ≥ the last existing time;
+        existing timestamps may be overwritten idempotently.
+      - No partial batches are ever committed.
+    """
     client = arraylake.Client(token=token)
     if token is None:
         client.login()
