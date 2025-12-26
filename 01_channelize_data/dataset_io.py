@@ -347,6 +347,8 @@ def ensure_time_in_arrays(
     # Now we do the actual appending of the time coordinates.
     # This will adjust the Zarr data.
     time_coord_array.append(encoded_times_to_append)
+    time_coord_array.attrs.clear()
+    time_coord_array.attrs.update(time_coord_attrs)
 
     # We now need to adjust all data variables that had the time dimension
     # as a dimension.  We use this by doing a "resize" on the zarr arrays,
@@ -358,7 +360,10 @@ def ensure_time_in_arrays(
         # Add the number of new times to the appropriate dimension
         current_shape[dim_index] += num_new_times
         # Resize
+        var_attrs = dict(zarr_array.attrs)
         zarr_array.resize(tuple(current_shape))
+        zarr_array.attrs.clear()
+        zarr_array.attrs.update(var_attrs)
 
     # Commit the changes if we have a session
     commit_message = (
