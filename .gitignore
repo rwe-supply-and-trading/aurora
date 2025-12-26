@@ -37,3 +37,5 @@ mlruns/
 
 *.out
 *__pycache__/
+
+*02_get_new_latents/
