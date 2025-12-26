@@ -67,6 +67,7 @@ import numpy as np
 import torch
 import xarray as xr
 import zarr
+from dataset_io import ensure_time_in_arrays
 from icechunk.distributed import merge_sessions
 
 from aurora import AuroraPretrained
@@ -262,12 +263,8 @@ def init(
 @cli.command()
 @click.argument("start-time", type=click.DateTime())
 @click.argument("end-time", type=click.DateTime())
-@click.option(
-    "--src-repo", type=str, default=SOURCE_REPO, help="Source repository", show_default=True
-)
-@click.option(
-    "--dest-repo", type=str, default=DESTINATION_REPO, help="Destination repo", show_default=True
-)
+@click.option("--src-repo", required=True, type=str, help="Source repository", show_default=True)
+@click.option("--dest-repo", type=str, required=True, help="Destination repo", show_default=True)
 @click.option(
     "--write-session-location",
     type=str,
@@ -277,9 +274,34 @@ def init(
 @click.option(
     "--aws-profile", type=str, default="kafou", help="AWS profile name", show_default=True
 )
-def save_lvs(start_time, end_time, src_repo, dest_repo, write_session_location, aws_profile):
-    """Generate and save latent vectors."""
+@click.option(
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
+)
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
+def save_lvs(
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    src_repo: str,
+    dest_repo: str,
+    write_session_location: str | None,
+    aws_profile: str,
+    src_branch: str,
+    dest_branch: str,
+) -> None:
+    """
+    Generate and write Aurora latent vectors for a contiguous time range.
 
+    This command:
+      - Validates 6-hourly time alignment
+      - Runs Aurora inference for each timestep
+      - Writes latent vectors at (t + 6h)
+      - Ensures the destination time axis is extended safely
+      - Updates dataset metadata to reflect newly written coverage
+
+    When `write_session_location` is provided, writes occur into a
+    coordinated session for later merging rather than committing
+    immediately.
+    """
     if (
         start_time.hour not in (0, 6, 12, 18)
         or start_time.minute != 0
@@ -313,10 +335,25 @@ def save_lvs(start_time, end_time, src_repo, dest_repo, write_session_location, 
 
     lve = LatentVectorExtractor(source_repo=src_repo, client=client)
 
+    # compute max time this job will write
+    final_write_time = end_time + datetime.timedelta(hours=6)
+
+    # 🔒 ensure time axis ONCE
+    ensure_time_in_arrays(
+        dest_session.store,
+        final_write_time,
+        time_dim="time",
+        time_frequency="auto",
+    )
+
+    last_written = None
+
     for timestamp in times:
         print(f"{timestamp:%Y-%m-%d %H:%M:%S}")
         lv = lve[timestamp]
-        lv.to_zarr(dest_session.store, zarr_format=3, consolidated=False, region="auto")
+        lv.to_zarr(dest_session.store, zarr_format=3, consolidated=False, region="auto", mode="a")
+
+        last_written = timestamp + datetime.timedelta(hours=6)
 
     if write_session_location is None:
         commit_id = dest_session.commit(
