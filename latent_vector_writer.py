@@ -331,7 +331,7 @@ def save_lvs(
             dest_session = pickle.load(fobj)
     else:
         repo = client.get_repo(dest_repo)
-        dest_session = repo.writable_session("main")
+        dest_session = repo.writable_session(dest_branch)
 
     lve = LatentVectorExtractor(source_repo=src_repo, client=client)
 
@@ -374,12 +374,8 @@ def save_lvs(
 @cli.command()
 @click.argument("start-time", type=click.DateTime())
 @click.argument("end-time", type=click.DateTime())
-@click.option(
-    "--src-repo", type=str, default=SOURCE_REPO, help="Source repository", show_default=True
-)
-@click.option(
-    "--dest-repo", type=str, default=DESTINATION_REPO, help="Destination repo", show_default=True
-)
+@click.option("--src-repo", type=str, required=True, help="Source repository", show_default=True)
+@click.option("--dest-repo", type=str, required=True, help="Destination repo", show_default=True)
 @click.option(
     "--aws-profile", type=str, default="kafou", help="AWS profile name", show_default=True
 )
@@ -389,10 +385,35 @@ def save_lvs(
     default="s3://icechunk-write-coordination",
     show_default=True,
 )
-@click.option("--timesteps-per-job", type=click.INT, default=4 * 2)
+@click.option("--timesteps-per-job", type=int, default=4 * 2)
+@click.option(
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
+)
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
 def submit_jobs(
-    start_time, end_time, src_repo, dest_repo, aws_profile, coordination_location, timesteps_per_job
-):
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    src_repo: str,
+    dest_repo: str,
+    aws_profile: str,
+    coordination_location: str,
+    timesteps_per_job: int,
+    src_branch: str,
+    dest_branch: str,
+) -> None:
+    """
+    Run distributed latent-vector generation via SLURM.
+
+    This command:
+      - Splits a large time range into smaller chunks
+      - Submits one GPU job per chunk
+      - Pre-extends the destination time axis once
+      - Merges completed write sessions
+      - Updates metadata and commits atomically
+
+    Intended for large historical backfills and high-throughput
+    production pipelines.
+    """
     if (
         start_time.hour not in (0, 6, 12, 18)
         or start_time.minute != 0
@@ -426,7 +447,19 @@ def submit_jobs(
 
     client = arraylake.Client()
     repo = client.get_repo(dest_repo)
-    session = repo.writable_session("main")
+    session = repo.writable_session(dest_branch)
+
+    # pre-extend time axis
+    final_write_time = end_time + datetime.timedelta(hours=6)
+    ensure_time_in_arrays(
+        session.store,
+        final_write_time,
+        time_dim="time",
+        time_frequency="auto",
+    )
+    # Optional but recommended: commit the pre-extension
+    session.commit(f"Pre-extend time axis through {final_write_time}")
+    session = repo.writable_session(dest_branch)
 
     print(f"Saving the session pickle to {session_pickle}")
     fs = fsspec.filesystem("s3", profile=aws_profile)
@@ -446,11 +479,13 @@ def submit_jobs(
             "--ntasks=1",
             "--cpus-per-task=32",
             "--gpus=1",
-            f"--job-name=lv-{lv_job_id} {start_string} {end_string}",
+            f"--job-name=lv-{lv_job_id}_{start_string}_{end_string}",
             sys.argv[0],
             "save-lvs",
             f"--src-repo={src_repo}",
             f"--dest-repo={dest_repo}",
+            f"--src-branch={src_branch}",
+            f"--dest-branch={src_branch}",
             f"--aws-profile={aws_profile}",
             f"--write-session-location={session_location}",
             start_string,
