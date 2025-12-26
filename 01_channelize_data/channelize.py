@@ -2,8 +2,12 @@
 USAGE EXAMPLE (run once with --init, then append with --no-init):
 
 tmux
+
 conda activate aurora
+
 srun --ntasks=1 --cpus-per-task=16 --gpus=0 --mem=300G --pty /bin/bash
+
+conda activate aurora
 
 python channelize.py \
     2009-01-01 \
@@ -25,12 +29,17 @@ import datetime
 import time
 
 import click
+import icechunk
 import kafou_arraylake as arraylake
 import numpy as np
 import xarray as xr
 import zarr
 from dataset_io import ensure_time_in_arrays
 
+# -----------------#
+# GLOBAL VARIABLES #
+# -----------------#
+READ_RETRIES = 6
 NAME_MAP = {
     "sfc": {
         "VAR_2T": "2t",
@@ -53,9 +62,9 @@ NAME_MAP = {
 }
 
 
-# ------------------#
+# -----------------#
 # HELPER FUNCTIONS #
-# ------------------#
+# -----------------#
 def day_bounds(ts: datetime.datetime) -> tuple[np.datetime64, np.datetime64]:
     """
     Return numpy datetime64 bounds for exactly:
@@ -82,7 +91,7 @@ def get_day_batches(start_time: datetime.datetime, end_time: datetime.datetime, 
         cursor = batch_end + one_day
 
 
-def get_variable_locations(n_pressure_levels: int):
+def get_variable_locations(n_pressure_levels: int) -> tuple[dict, dict]:
     """
     Compute channel index layout for surface + pressure-level variables.
 
@@ -113,118 +122,13 @@ def get_variable_locations(n_pressure_levels: int):
     return in_locs, out_locs
 
 
-def process_day_from_datasets(
-    *,
-    store,
-    timestamp: datetime.datetime,
-    sfc_ds: xr.Dataset,
-    pl_ds: xr.Dataset,
-):
-    """
-    Process exactly ONE calendar day and write its 4 timesteps.
-
-    This function:
-      - loads ONLY one day's worth of data
-      - builds a dense (time, channel, lat, lon) block
-      - region-writes into an EXISTING Zarr store
-
-    SAFE FOR APPENDS:
-      - assumes schema already exists
-      - relies on ensure_time_in_arrays() for time extension
-    """
-    print(f"\n=== PROCESSING {timestamp:%Y-%m-%d} ===")
-
-    # 1) Slice day: 00Z → 18Z
-    d0, d1 = day_bounds(timestamp)
-
-    sfc_vars = list(NAME_MAP["sfc"])
-    pl_vars = list(NAME_MAP["pl"])
-
-    sfc_day = sfc_ds[sfc_vars].sel(time=slice(d0, d1)).load()
-    pl_day = pl_ds[pl_vars].sel(time=slice(d0, d1)).load()
-
-    if sfc_day.time.size != 4:
-        raise RuntimeError(
-            f"{timestamp:%Y-%m-%d}: expected 4 timesteps (00/06/12/18Z), got {sfc_day.time.size}"
-        )
-
-    # sanity: pl must match the same 4 times
-    if pl_day.time.size != 4 or not np.array_equal(pl_day.time.values, sfc_day.time.values):
-        raise RuntimeError(f"{timestamp:%Y-%m-%d}: pl times don’t match sfc times")
-
-    new_times = sfc_day.time.values
-
-    # Ensure the destination store has capacity for these timestamps.
-    # This EXTENDS the time dimension if needed.
-    ensure_time_in_arrays(
-        store,
-        timestamp=new_times[-1],  # last timestamp we will write
-        time_frequency="6h",
-        group="samples",
-    )
-
-    # 2) Channel layout
-    n_levels = int(pl_day.level.size)
-    in_locs, _ = get_variable_locations(n_levels)
-
-    T = 4
-    Y = int(sfc_day.latitude.size)
-    X = int(sfc_day.longitude.size)
-    n_channels = len(NAME_MAP["sfc"]) + (len(NAME_MAP["pl"]) * n_levels)
-
-    # Preallocate dense block for this day
-    block = np.zeros((T, n_channels, Y, X), dtype=np.float32)
-
-    # Fill surface channels
-    for varname, (cidx, _) in in_locs["sfc"].items():
-        block[:, cidx, :, :] = sfc_day[varname].values
-
-    # Fill pressure-level channels (flattened over levels)
-    for varname, (cidx, size) in in_locs["pl"].items():
-        v = pl_day[varname].values  # (time, level, lat, lon)
-        block[:, cidx : cidx + size, :, :] = v
-
-    # 3) Build dataset containing ONLY the variable we intend to write
-    # Coordinates MUST match the destination schema.
-    write_ds = xr.Dataset(
-        {
-            "sample_data": (
-                ("time", "channel", "latitude", "longitude"),
-                block,
-            )
-        },
-        coords={
-            "time": new_times,
-            "channel": np.arange(n_channels, dtype=np.int32),
-            "latitude": sfc_day.latitude.values,
-            "longitude": sfc_day.longitude.values,
-        },
-    )
-
-    # 4) Region write by coordinate labels
-    # IMPORTANT:
-    # - mode="a" → append / overwrite existing regions
-    # - region="auto" → xarray resolves correct indices from time coords
-    # - If timestamps already exist, THIS OVERWRITES THEM (by design)
-    write_ds.to_zarr(
-        store,
-        group="samples",
-        region="auto",
-        mode="a",
-        consolidated=False,
-    )
-
-    print(f"   ✔ Finished writing day {timestamp:%Y-%m-%d}")
-    return write_ds
-
-
 # BATCHED INGEST
 def open_src_datasets(
     *,
     src_repo: str,
     src_branch: str = "main",
     token: str | None = None,
-):
+) -> tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
     """
     Grabs the base datasets from the source repo. Assumes either ERA5 or ECMWF ENFO format.
     """
@@ -313,96 +217,213 @@ def open_src_datasets(
     return sfc_ds, pl_ds, inv_ds
 
 
-def sequential_reorg(
+# ------------#
+# CHANNELIZE #
+# ------------#
+def channelize_day(
     *,
-    sfc_ds,
-    pl_ds,
-    src_repo_name,
-    dst_repo_name,
-    start_time,
-    end_time,
-    src_branch="main",
-    dst_branch="main",
-    token=None,
-    days_at_once=14,
-):
-    # Initialize Arraylake client
+    store,
+    timestamp: datetime.datetime,
+    sfc_ds: xr.Dataset,
+    pl_ds: xr.Dataset,
+) -> xr.Dataset:
+    """
+    Process one UTC calendar day (00/06/12/18Z) and region-write its data
+    into an existing Zarr samples store.
+
+    - Loads exactly one day of surface and pressure-level data
+    - Builds a dense (time, channel, lat, lon) block
+    - Writes ONLY `samples/sample_data` using coordinate-based region writes
+
+    - Requires exactly 4 timesteps; mismatches raise immediately
+    - Pressure-level variables are flattened across levels into channels
+    - Time dimension is extended if needed via `ensure_time_in_arrays()`
+    - Existing timestamps are intentionally overwritten (idempotent)
+
+    Assumptions
+    -----------
+    - Destination store and schema already exist
+    - Channel layout matches `NAME_MAP` / `get_variable_locations()`
+    """
+    print(f"\n=== PROCESSING {timestamp:%Y-%m-%d} ===")
+
+    # 1) Slice day: 00Z → 18Z
+    d0, d1 = day_bounds(timestamp)
+
+    sfc_vars = list(NAME_MAP["sfc"])
+    pl_vars = list(NAME_MAP["pl"])
+
+    # Read with retries
+    # Icechunk streaming errors, S3 connection stalls, network issues, etc.
+    for attempt in range(1, READ_RETRIES + 1):
+        try:
+            sfc_day = sfc_ds[sfc_vars].sel(time=slice(d0, d1)).load()
+            pl_day = pl_ds[pl_vars].sel(time=slice(d0, d1)).load()
+            break
+
+        except (OSError, RuntimeError, icechunk.IcechunkError) as e:
+            print(f"   → exception type: {type(e).__name__}")
+            if attempt == READ_RETRIES:
+                print(
+                    f"Read failed for {timestamp:%Y-%m-%d} "
+                    f"after {READ_RETRIES} attempts — aborting day."
+                )
+                raise
+
+            print(f"Read failed for {timestamp:%Y-%m-%d} (attempt {attempt}/{READ_RETRIES}): {e}")
+
+    if sfc_day.time.size != 4:
+        raise RuntimeError(
+            f"{timestamp:%Y-%m-%d}: expected 4 timesteps (00/06/12/18Z), got {sfc_day.time.size}"
+        )
+
+    # sanity: pl must match the same 4 times
+    if pl_day.time.size != 4 or not np.array_equal(pl_day.time.values, sfc_day.time.values):
+        raise RuntimeError(f"{timestamp:%Y-%m-%d}: pl times don’t match sfc times")
+
+    new_times = sfc_day.time.values
+
+    # Ensure the destination store has capacity for these timestamps.
+    # This EXTENDS the time dimension if needed.
+    ensure_time_in_arrays(
+        store,
+        timestamp=new_times[-1],  # last timestamp we will write
+        time_frequency="6h",
+        group="samples",
+    )
+
+    # 2) Channel layout
+    n_levels = int(pl_day.level.size)
+    in_locs, _ = get_variable_locations(n_levels)
+
+    T = 4
+    Y = int(sfc_day.latitude.size)
+    X = int(sfc_day.longitude.size)
+    n_channels = len(NAME_MAP["sfc"]) + (len(NAME_MAP["pl"]) * n_levels)
+
+    # Preallocate dense block for this day
+    block = np.zeros((T, n_channels, Y, X), dtype=np.float32)
+
+    # Fill surface channels
+    for varname, (cidx, _) in in_locs["sfc"].items():
+        block[:, cidx, :, :] = sfc_day[varname].values
+
+    # Fill pressure-level channels (flattened over levels)
+    for varname, (cidx, size) in in_locs["pl"].items():
+        v = pl_day[varname].values  # (time, level, lat, lon)
+        block[:, cidx : cidx + size, :, :] = v
+
+    # 3) Build dataset containing ONLY the variable we intend to write
+    # Coordinates MUST match the destination schema.
+    write_ds = xr.Dataset(
+        {
+            "sample_data": (
+                ("time", "channel", "latitude", "longitude"),
+                block,
+            )
+        },
+        coords={
+            "time": new_times,
+            "latitude": sfc_day.latitude.values,
+            "longitude": sfc_day.longitude.values,
+        },
+    )
+
+    # 4) Region write by coordinate labels
+    # IMPORTANT:
+    # - mode="a" → append / overwrite existing regions
+    # - region="auto" → xarray resolves correct indices from time coords
+    # - If timestamps already exist, THIS OVERWRITES THEM (by design)
+    write_ds.to_zarr(
+        store,
+        group="samples",
+        region="auto",
+        mode="a",
+        consolidated=False,
+    )
+
+    print(f"   ✔ Finished writing day {timestamp:%Y-%m-%d}")
+    return write_ds
+
+
+def channelize_dataset(
+    *,
+    sfc_ds: xr.Dataset,
+    pl_ds: xr.Dataset,
+    dst_repo: str,
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    dst_branch: str = "main",
+    token: str | None = None,
+    days_at_once: int = 14,
+) -> None:
     client = arraylake.Client(token=token)
     if token is None:
         client.login()
 
-    # Open destination repo
-    dst_repo = client.get_repo(dst_repo_name)
+    repo = client.get_repo(dst_repo)
+    last_committed: datetime.date | None = None
 
-    # Track last successfully committed day
-    last_committed_day = None
-
-    # Process days in batches ex. 14 days at a time would be 14 batches
-    batches = get_day_batches(start_time=start_time, end_time=end_time, days_at_once=days_at_once)
-
-    # for each batch ...
-    for batch in batches:
-        print(f"\n▶️  BATCH {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}")
+    for batch in get_day_batches(start_time, end_time, days_at_once):
+        start, end = batch[0], batch[-1]
+        print(f"\n▶️  BATCH {start:%Y-%m-%d} → {end:%Y-%m-%d}")
         t0 = time.monotonic()
 
-        # Get fresh writable session for each batch
-        dst_session = dst_repo.writable_session(dst_branch)
+        session = repo.writable_session(dst_branch)
 
-        # Try to process each day in the batch
         try:
             for day in batch:
-                process_day_from_datasets(
-                    store=dst_session.store,
+                t_day = time.monotonic()
+                channelize_day(
+                    store=session.store,
                     timestamp=day,
                     sfc_ds=sfc_ds,
                     pl_ds=pl_ds,
                 )
+                print(f"   ⏱ {day:%Y-%m-%d}: {time.monotonic() - t_day:.2f}s")
 
-            commit_msg = f"Added batch {batch[0]:%Y-%m-%d} → {batch[-1]:%Y-%m-%d}"
-
-            # Add retry logic. Sometimes icechunk repo has
-            for attempt in range(1, 7):
-                try:
-                    cid = dst_session.commit(commit_msg)
-                    print(f"   COMMIT SUCCESS — {cid}")
-                    last_committed_day = batch[-1].date()
-                    break
-                except Exception as e:
-                    print(f"   Commit attempt #{attempt} failed: {e}")
-                    if attempt == 6:
-                        raise RuntimeError("Max commit retries reached.")
-                    time.sleep(2**attempt)
-
-            print(f"   ⏱ Batch completed in {time.monotonic() - t0:.2f}s")
-
-        # If any day in the batch fails, exit the entire process,
-        # reporting the last successful day processed
         except Exception as e:
-            print("\n   Batch failure:", e)
+            print(f"\n     Batch failure after {time.monotonic() - t0:.2f}s")
+            print(f"   Reason: {e}")
+            print(
+                f"RESTART_CURSOR={last_committed:%Y-%m-%d}"
+                if last_committed
+                else "RESTART_CURSOR=NONE"
+            )
+            raise
 
-            if last_committed_day is not None:
-                # 🔒 single source of truth for restart
-                print(f"RESTART_CURSOR={last_committed_day:%Y-%m-%d}")
-                print(f"   Last successfully COMMITTED day: {last_committed_day:%Y-%m-%d}")
-            else:
-                print("RESTART_CURSOR=NONE")
-                print("   No batches were successfully committed yet.")
+        for attempt in range(1, 7):
+            try:
+                cid = session.commit(f"Added batch {start:%Y-%m-%d} → {end:%Y-%m-%d}")
+                print(f"   COMMIT SUCCESS — {cid}")
+                last_committed = end.date()
+                print(f"   LAST COMMITTED DAY {last_committed:%Y-%m-%d}")
+                break
+            except (RuntimeError, icechunk.IcechunkError):
+                if attempt == 6:
+                    print("   Commit failed permanently")
+                    print(
+                        f"RESTART_CURSOR={last_committed:%Y-%m-%d}"
+                        if last_committed
+                        else "RESTART_CURSOR=NONE"
+                    )
+                    raise
+                time.sleep(2**attempt)
 
-            raise SystemExit(1)
+        print(f"     Committed days {start:%Y-%m-%d} → {last_committed:%Y-%m-%d}")
+        print(f"   ⏱ Batch committed in {time.monotonic() - t0:.2f}s")
 
 
-# -------------------------
-# Initialization
-# -------------------------
-
-
+# ---------------#
+# INITIALE STORE #
+# ---------------#
 def init_store(
     store: zarr.abc.store.Store,
     *,
     sfc_ds: xr.Dataset,
     pl_ds: xr.Dataset,
     inv_ds: xr.Dataset,
-):
+) -> None:
     """
     Initialize the destination Zarr layout.
 
@@ -420,18 +441,14 @@ def init_store(
 
     print("Initializing destination store...")
 
-    # ------------------------------------------------------------------
     # Invariant fields
-    # ------------------------------------------------------------------
     print("  • Writing 'invariant' group...")
     # Select just the invariant variables we want and rename them appropriately.
     inv_ds = inv_ds[["Z", "LSM", "SLT"]]
     inv_ds = inv_ds.rename(NAME_MAP["inv"])
     inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False)
 
-    # ------------------------------------------------------------------
     # Schema derivation
-    # ------------------------------------------------------------------
     time_coord = sfc_ds.time
     lat_coord = sfc_ds.latitude
     lon_coord = sfc_ds.longitude
@@ -442,9 +459,7 @@ def init_store(
     _, out_var_locs = get_variable_locations(n_levels)
     n_channels = len(NAME_MAP["sfc"]) + len(NAME_MAP["pl"]) * n_levels
 
-    # ------------------------------------------------------------------
     # Samples coordinates
-    # ------------------------------------------------------------------
     print("  • Writing 'samples' coordinates...")
     coords_ds = xr.Dataset(
         data_vars={
@@ -452,7 +467,6 @@ def init_store(
         },
         coords={
             "time": time_coord,
-            "channel": np.arange(n_channels, dtype="int32"),
             "latitude": lat_coord,
             "longitude": lon_coord,
         },
@@ -475,9 +489,7 @@ def init_store(
         },
     )
 
-    # ------------------------------------------------------------------
     # Empty sample_data array
-    # ------------------------------------------------------------------
     group = zarr.open_group(store, path="samples", mode="a")
 
     time_len = len(time_coord)
@@ -490,6 +502,7 @@ def init_store(
 
     compressors = [
         zarr.codecs.BloscCodec(
+            typesize=4,
             clevel=3,
             shuffle=zarr.codecs.BloscShuffle.bitshuffle,
         )
@@ -520,16 +533,16 @@ def init_store(
 @click.option("--days-at-once", type=int, default=14)
 @click.option("--init/--no-init", default=False)
 def main(
-    start_time,
-    end_time,
-    src_repo,
-    dst_repo,
-    src_branch,
-    dst_branch,
-    token,
-    days_at_once,
-    init,
-):
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    src_repo: str,
+    dst_repo: str,
+    src_branch: str,
+    dst_branch: str,
+    token: str,
+    days_at_once: int,
+    init: bool,
+) -> None:
     """
     Reorganize RAW IC data.
 
@@ -580,14 +593,12 @@ def main(
         return
 
     # Otherwise, we want to fill it with data
-    sequential_reorg(
+    channelize_dataset(
         sfc_ds=sfc_ds,
         pl_ds=pl_ds,
-        src_repo_name=src_repo,
-        dst_repo_name=dst_repo,
+        dst_repo=dst_repo,
         start_time=start_time,
         end_time=end_time,
-        src_branch=src_branch,
         dst_branch=dst_branch,
         token=token,
         days_at_once=days_at_once,
