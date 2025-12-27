@@ -180,15 +180,6 @@ class LatentVectorExtractor:
             session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
         )
 
-        print("=== SAMPLE_DS TIME DEBUG ===")
-        print("sample_ds.time dtype:", sample_ds.time.dtype)
-        print("sample_ds.time values dtype:", sample_ds.time.values.dtype)
-        print("sample_ds.time.values[0]:", sample_ds.time.values[0])
-        print("type(sample_ds.time.values[0]):", type(sample_ds.time.values[0]))
-        print("min time:", sample_ds.time.min().values)
-        print("max time:", sample_ds.time.max().values)
-        print("============================")
-
         self.data_loader = ERA5DataLoaderFOAM(sample_ds=sample_ds, invariant_ds=inv_ds)
 
         self.model = AuroraPretrained()
@@ -197,13 +188,6 @@ class LatentVectorExtractor:
         self.model.to("cuda")
 
     def __getitem__(self, item: datetime.datetime):
-        print("=== LVE __getitem__ DEBUG ===")
-        print("item:", item)
-        print("type(item):", type(item))
-        print("tzinfo:", item.tzinfo)
-        print("iso:", item.isoformat())
-        print("============================")
-
         if not isinstance(item, datetime.datetime):
             raise KeyError("Invalid key; must be datetime object")
 
@@ -361,12 +345,6 @@ def save_lvs(
 
     for timestamp in times:
         print(f"{timestamp:%Y-%m-%d %H:%M:%S}")
-        print("=== TIMESTAMP DEBUG ===")
-        print("timestamp:", timestamp)
-        print("type(timestamp):", type(timestamp))
-        print("tzinfo:", timestamp.tzinfo)
-        print("iso:", timestamp.isoformat())
-        print("=======================")
         lv = lve[timestamp]  # this is returns an array at timestamp + 6h
         lv.to_zarr(dest_session.store, zarr_format=3, consolidated=False, region="auto", mode="a")
 
