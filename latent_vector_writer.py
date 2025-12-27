@@ -34,7 +34,7 @@ in HPC environments.
 To Run:
 -------
 
-tmux 
+tmux
 
 conda activate aurora
 
