@@ -38,17 +38,16 @@ tmux
 
 conda activate aurora
 
-sbatch   --ntasks=1   --cpus-per-task=8   --mem=50G  --job-name=lv-submit   --wrap="
-    python latent_vector_writer.py submit-jobs \
-      2025-01-01T00:00:00 \
-      2025-04-01T00:00:00 \
-      --src-repo kafou/aurora-era5-samples \
-      --src-branch extend-2025 \
-      --dest-repo kafou/aurora-era5-t1-latent-vectors \
-      --dest-branch main \
-      --aws-profile kafou \
-      --timesteps-per-job 8 \
-      --coordination-location s3://icechunk-write-coordination"
+sbatch --ntasks=1 --cpus-per-task=8 --mem=50G --job-name=lv-submit --wrap='python latent_vector_writer.py submit-jobs \
+    2025-11-16T00:00:00 \
+    2025-11-17T18:00:00 \
+    --src-repo kafou/aurora-era5-samples \
+    --src-branch extend-2025 \
+    --dest-repo kafou/aurora-era5-t1-latent-vectors \
+    --dest-branch main \
+    --aws-profile kafou \
+    --timesteps-per-job 1 \
+    --coordination-location s3://icechunk-write-coordination'
 
 """
 
@@ -181,6 +180,15 @@ class LatentVectorExtractor:
             session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
         )
 
+        print("=== SAMPLE_DS TIME DEBUG ===")
+        print("sample_ds.time dtype:", sample_ds.time.dtype)
+        print("sample_ds.time values dtype:", sample_ds.time.values.dtype)
+        print("sample_ds.time.values[0]:", sample_ds.time.values[0])
+        print("type(sample_ds.time.values[0]):", type(sample_ds.time.values[0]))
+        print("min time:", sample_ds.time.min().values)
+        print("max time:", sample_ds.time.max().values)
+        print("============================")
+
         self.data_loader = ERA5DataLoaderFOAM(sample_ds=sample_ds, invariant_ds=inv_ds)
 
         self.model = AuroraPretrained()
@@ -189,6 +197,13 @@ class LatentVectorExtractor:
         self.model.to("cuda")
 
     def __getitem__(self, item: datetime.datetime):
+        print("=== LVE __getitem__ DEBUG ===")
+        print("item:", item)
+        print("type(item):", type(item))
+        print("tzinfo:", item.tzinfo)
+        print("iso:", item.isoformat())
+        print("============================")
+
         if not isinstance(item, datetime.datetime):
             raise KeyError("Invalid key; must be datetime object")
 
@@ -198,11 +213,9 @@ class LatentVectorExtractor:
 
         # Return a latent vector dataset with the timestamp moved forward 6 hours to match
         # the next Aurora prediction timestep corresponding to the latent vector extracted.
-        out_time = item + datetime.timedelta(hours=6)  # ← single, explicit semantic step
-
         return xr.Dataset(
             coords={
-                "time": xr.DataArray([out_time], dims=("time",)),
+                "time": xr.DataArray([item + datetime.timedelta(hours=6)], dims=("time",)),
             },
             data_vars={"lv": xr.DataArray(lv, dims=("time", "spatial_location", "feature"))},
         )
@@ -333,7 +346,7 @@ def save_lvs(
         repo = client.get_repo(dest_repo)
         dest_session = repo.writable_session(dest_branch)
 
-    lve = LatentVectorExtractor(source_repo=src_repo, client=client)
+    lve = LatentVectorExtractor(source_branch=src_branch, source_repo=src_repo, client=client)
 
     # compute max time this job will write
     final_write_time = end_time + datetime.timedelta(hours=6)
@@ -346,14 +359,16 @@ def save_lvs(
         time_frequency="auto",
     )
 
-    last_written = None
-
     for timestamp in times:
         print(f"{timestamp:%Y-%m-%d %H:%M:%S}")
-        lv = lve[timestamp]
+        print("=== TIMESTAMP DEBUG ===")
+        print("timestamp:", timestamp)
+        print("type(timestamp):", type(timestamp))
+        print("tzinfo:", timestamp.tzinfo)
+        print("iso:", timestamp.isoformat())
+        print("=======================")
+        lv = lve[timestamp]  # this is returns an array at timestamp + 6h
         lv.to_zarr(dest_session.store, zarr_format=3, consolidated=False, region="auto", mode="a")
-
-        last_written = timestamp + datetime.timedelta(hours=6)
 
     if write_session_location is None:
         commit_id = dest_session.commit(
@@ -450,16 +465,16 @@ def submit_jobs(
     session = repo.writable_session(dest_branch)
 
     # pre-extend time axis
-    final_write_time = end_time + datetime.timedelta(hours=6)
-    ensure_time_in_arrays(
-        session.store,
-        final_write_time,
-        time_dim="time",
-        time_frequency="auto",
-    )
-    # Optional but recommended: commit the pre-extension
-    session.commit(f"Pre-extend time axis through {final_write_time}")
-    session = repo.writable_session(dest_branch)
+    # final_write_time = end_time + datetime.timedelta(hours=6)
+    # ensure_time_in_arrays(
+    #     session.store,
+    #     final_write_time,
+    #     time_dim="time",
+    #     time_frequency="auto",
+    # )
+    # # Optional but recommended: commit the pre-extension
+    # session.commit(f"Pre-extend time axis through {final_write_time}")
+    # session = repo.writable_session(dest_branch)
 
     print(f"Saving the session pickle to {session_pickle}")
     fs = fsspec.filesystem("s3", profile=aws_profile)
