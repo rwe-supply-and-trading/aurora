@@ -135,6 +135,7 @@ def init_zarr_store(*, store, n_init, n_lead, latent_dim, init_times, lead_times
         shape=(n_init, n_lead, latent_dim),
         dtype="float32",
         fill_value=np.nan,
+        compressors=[],
         dimension_names=("init_time", "lead_time", "lv"),
     )
 

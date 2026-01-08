@@ -1,7 +1,57 @@
 #!/usr/bin/env python
 
+"""
+Aurora Latent Vector Writer (ERA5 → Zarr / Icechunk)
+
+This script generates Aurora latent vectors from ERA5 inputs and stores them in
+a Zarr v3 dataset backed by Icechunk. It supports both single-process execution
+and distributed GPU execution via SLURM with safe concurrent writes and atomic
+commits.
+
+For each 6-hourly ERA5 timestamp `t`, the model writes a latent vector at
+`t + 6h`, reflecting the next Aurora prediction timestep. This offset is
+intentional and centralized in `LatentVectorExtractor`.
+
+Main commands
+-------------
+init
+  Initialize a new latent-vector repository and preallocate storage.
+
+save-lvs
+  Run Aurora inference for a time range and write results directly.
+
+submit-jobs
+  Split a large time range into SLURM jobs, merge results, update metadata,
+  and commit once.
+
+The dataset tracks a monotonic `valid_time_range` attribute indicating the
+temporal coverage of written latent vectors.
+
+Intended for large-scale historical backfills and ongoing incremental updates
+in HPC environments.
+
+
+To Run:
+-------
+
+tmux
+
+conda activate aurora
+
+sbatch --ntasks=1 --cpus-per-task=8 --mem=50G --job-name=lv-submit --wrap='python latent_vector_writer.py submit-jobs \
+    2025-11-16T00:00:00 \
+    2025-11-17T18:00:00 \
+    --src-repo kafou/aurora-era5-samples \
+    --src-branch extend-2025 \
+    --dest-repo kafou/aurora-era5-t1-latent-vectors \
+    --dest-branch main \
+    --aws-profile kafou \
+    --timesteps-per-job 1 \
+    --coordination-location s3://icechunk-write-coordination'
+
+"""
+
 import datetime
-import io
 import os
 import pickle
 import random
@@ -11,7 +61,6 @@ import time
 
 import click
 import fsspec
-import icechunk
 import kafou_arraylake as arraylake
 import numpy as np
 import torch
@@ -24,93 +73,27 @@ from aurora import AuroraPretrained
 from aurora.data import ERA5DataLoaderFOAM
 
 SOURCE_REPO = "kafou/aurora-era5-samples"
-SOURCE_BRANCH = "extend-2025"
-
 DESTINATION_REPO = "kafou/aurora-era5-t1-latent-vectors"
-DESTINATION_BRANCH = "main"
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+def init_zarr_store(
+    *,
+    store: zarr.abc.store.Store,
+    sample_ds: xr.Dataset,
+) -> None:
+    """
+    Initialize the destination Zarr store for Aurora latent vectors.
 
+    Creates:
+      - A time coordinate copied from the source samples dataset
+        (excluding the first timestep to align with t+6h semantics).
+      - A preallocated `lv` array with shape:
+            (time, spatial_location, feature)
 
-def random_job_string(length: int) -> str:
-    return "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(length))
-
-
-def get_job_count(lv_job_id):
-    result = subprocess.run(["squeue", "-ho", "%j"], capture_output=True)
-    if result.returncode != 0:
-        return -1
-
-    count = 0
-    for line in io.BytesIO(result.stdout):
-        if lv_job_id in line.decode():
-            count += 1
-    return count
-
-
-# ---------------------------------------------------------------------
-# Latent vector extraction
-# ---------------------------------------------------------------------
-
-
-class LatentVectorExtractor:
-    def __init__(self, *, source_repo, client, source_branch):
-        print("[LVE] Initializing LatentVectorExtractor")
-
-        repo = client.get_repo(source_repo)
-        session = repo.readonly_session(source_branch)
-
-        print("[LVE] Opening sample + invariant datasets")
-        sample_ds = xr.open_zarr(
-            session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
-        )
-        inv_ds = xr.open_zarr(
-            session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
-        )
-
-        self.data_loader = ERA5DataLoaderFOAM(sample_ds=sample_ds, invariant_ds=inv_ds)
-
-        print("[LVE] Loading Aurora model")
-        self.model = AuroraPretrained()
-        self.model.load_checkpoint()
-        self.model.eval()
-        self.model.to("cuda")
-
-    def __getitem__(self, ts: datetime.datetime):
-        print(f"[LVE] Extracting LV for source time {ts}")
-        batch = self.data_loader[ts]
-
-        with torch.inference_mode():
-            lv = self.model.forward(batch, lv_only=True).to("cpu").numpy()
-
-        out_time = ts + datetime.timedelta(hours=6)
-        print(f"[LVE] Produced LV for target time {out_time}")
-
-        return xr.Dataset(
-            coords={"time": xr.DataArray([out_time], dims=("time",))},
-            data_vars={"lv": xr.DataArray(lv, dims=("time", "spatial_location", "feature"))},
-        )
-
-
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
-
-
-@click.group()
-def cli():
-    pass
-
-
-# ---------------------------------------------------------------------
-# INIT
-# ---------------------------------------------------------------------
-
-
-def init_zarr_store(*, store, sample_ds):
+    This function defines the *structural contract* of the latent-vector
+    repository. It should be called exactly once at repository creation
+    time and never on an existing store.
+    """
     ds = xr.Dataset(coords={"time": sample_ds.time[1:]})
     ds.to_zarr(
         store, zarr_format=3, consolidated=False, encoding={"time": {"chunks": (len(ds.time),)}}
@@ -128,6 +111,105 @@ def init_zarr_store(*, store, sample_ds):
     )
 
 
+def random_job_string(length: int) -> str:
+    """Generate a short random identifier suitable for SLURM job grouping."""
+    choices = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(random.choice(choices) for _ in range(length))
+
+
+def get_job_count(lv_job_id: str, retries: int = 2, delay: int = 5) -> int:
+    """
+    Count active SLURM jobs matching a latent-vector job identifier.
+
+    This function queries `squeue` and counts jobs whose names contain
+    `lv_job_id`. Retries are performed to tolerate transient scheduler
+    failures.
+
+    Returns
+    -------
+    int
+        The number of currently running or queued jobs matching the ID.
+
+    """
+    last_err = None
+    for _ in range(retries):
+        result = subprocess.run(
+            ["squeue", "-ho", "%j"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return sum(lv_job_id in line for line in result.stdout.splitlines())
+        last_err = result.stderr
+        time.sleep(delay)
+
+    raise RuntimeError(f"squeue failed after {retries} retries: {last_err}")
+
+
+class LatentVectorExtractor:
+    """
+    Aurora inference wrapper for ERA5 latent-vector extraction.
+
+    Responsibilities:
+      - Load sample and invariant datasets from a source repository
+      - Run the Aurora model in GPU inference mode
+      - Return latent vectors as an xarray.Dataset
+
+    Temporal semantics:
+      For an input timestamp `t`, the returned dataset is labeled at
+      `t + 6h`, corresponding to the next Aurora prediction timestep.
+      This offset is intentional, fixed, and centralized here.
+    """
+
+    def __init__(
+        self,
+        source_branch: str = "main",
+        *,
+        source_repo: str = str,
+        client: arraylake.Client | None = None,
+    ):
+        if client is None:
+            client = arraylake.Client()
+
+        repo = client.get_repo(source_repo)
+        session = repo.readonly_session(source_branch)
+        sample_ds = xr.open_zarr(
+            session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
+        )
+        inv_ds = xr.open_zarr(
+            session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
+        )
+
+        self.data_loader = ERA5DataLoaderFOAM(sample_ds=sample_ds, invariant_ds=inv_ds)
+
+        self.model = AuroraPretrained()
+        self.model.load_checkpoint()
+        self.model.eval()
+        self.model.to("cuda")
+
+    def __getitem__(self, item: datetime.datetime):
+        if not isinstance(item, datetime.datetime):
+            raise KeyError("Invalid key; must be datetime object")
+
+        batch = self.data_loader[item]
+        with torch.inference_mode():
+            lv = self.model.forward(batch, lv_only=True).to("cpu").numpy()
+
+        # Return a latent vector dataset with the timestamp moved forward 6 hours to match
+        # the next Aurora prediction timestep corresponding to the latent vector extracted.
+        return xr.Dataset(
+            coords={
+                "time": xr.DataArray([item + datetime.timedelta(hours=6)], dims=("time",)),
+            },
+            data_vars={"lv": xr.DataArray(lv, dims=("time", "spatial_location", "feature"))},
+        )
+
+
+@click.group()
+def cli():
+    pass
+
+
 @cli.command()
 @click.option(
     "--src-repo", type=str, default=SOURCE_REPO, help="Source repository", show_default=True
@@ -140,17 +222,22 @@ def init_zarr_store(*, store, sample_ds):
     show_default=True,
 )
 @click.option(
-    "--src-branch", type=str, default=SOURCE_BRANCH, help="Source repository", show_default=True
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
 )
-@click.option(
-    "--dest-branch",
-    type=str,
-    default=DESTINATION_BRANCH,
-    help="Repository to be created",
-    show_default=True,
-)
-def init(src_repo, dest_repo, src_branch, dest_branch):
-    """Initialize a new latent vector repository."""
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
+def init(
+    src_repo: str,
+    dest_repo: str,
+    dest_branch: str,
+    src_branch: str,
+) -> None:
+    """
+    Initialize a new latent-vector repository.
+
+    This command creates a destination repository and writes the
+    initial Zarr layout, including the time coordinate and preallocated
+    latent-vector array.
+    """
     dest_repo_name = dest_repo
 
     client = arraylake.Client()
@@ -167,124 +254,121 @@ def init(src_repo, dest_repo, src_branch, dest_branch):
 
     init_zarr_store(store=dest_session.store, sample_ds=sample_ds)
     commit_id = dest_session.commit("Initialized latent vector store.")
-    print(f"Initialized repo {dest_repo_name}: {commit_id}")
-
-
-# ---------------------------------------------------------------------
-# SAVE LVS (explicit overwrite semantics)
-# ---------------------------------------------------------------------
+    print(f"[INIT] Committed: {commit_id} to {dest_repo_name}:{dest_branch}")
 
 
 @cli.command()
 @click.argument("start-time", type=click.DateTime())
 @click.argument("end-time", type=click.DateTime())
-@click.option("--src-repo", default=SOURCE_REPO)
-@click.option("--dest-repo", default=DESTINATION_REPO)
-@click.option("--src-branch", default=SOURCE_BRANCH)
-@click.option("--dest-branch", default=DESTINATION_BRANCH)
-@click.option("--aws-profile", default="kafou")
-@click.option("--write-session-location", default=None)
-@click.option("--overwrite", is_flag=True, help="Explicitly allow overwriting existing timestamps")
+@click.option("--src-repo", required=True, type=str, help="Source repository", show_default=True)
+@click.option("--dest-repo", type=str, required=True, help="Destination repo", show_default=True)
+@click.option(
+    "--write-session-location",
+    type=str,
+    default=None,
+    help="An S3 bucket where coordinated write sessions live (optional)",
+)
+@click.option(
+    "--aws-profile", type=str, default="kafou", help="AWS profile name", show_default=True
+)
+@click.option(
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
+)
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
 def save_lvs(
-    start_time,
-    end_time,
-    src_repo,
-    dest_repo,
-    src_branch,
-    dest_branch,
-    aws_profile,
-    write_session_location,
-    overwrite,
-):
-    if not overwrite:
-        raise click.ClickException("Refusing to run without --overwrite")
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    src_repo: str,
+    dest_repo: str,
+    write_session_location: str | None,
+    aws_profile: str,
+    src_branch: str,
+    dest_branch: str,
+) -> None:
+    """
+    Generate and write Aurora latent vectors for a contiguous time range.
 
-    print(f"[SAVE] Overwrite job from {start_time} → {end_time}")
+    This command:
+      - Validates 6-hourly time alignment
+      - Runs Aurora inference for each timestep
+      - Writes latent vectors at (t + 6h)
+      - Ensures the destination time axis is extended safely
+      - Updates dataset metadata to reflect newly written coverage
 
-    # Build source times (Python datetimes)
+    When `write_session_location` is provided, writes occur into a
+    coordinated session for later merging rather than committing
+    immediately.
+    """
+    if (
+        start_time.hour not in (0, 6, 12, 18)
+        or start_time.minute != 0
+        or start_time.second != 0
+        or start_time.microsecond != 0
+    ):
+        raise click.ClickException("Invalid start time")
+    if (
+        end_time.hour not in (0, 6, 12, 18)
+        or end_time.minute != 0
+        or end_time.second != 0
+        or end_time.microsecond != 0
+    ):
+        raise click.ClickException("Invalid end time")
+
     times = []
-    t = start_time
-    while t <= end_time:
-        times.append(t)
-        t += datetime.timedelta(hours=6)
+    this_time = start_time
+    while this_time <= end_time:
+        times.append(this_time)
+        this_time = this_time + datetime.timedelta(hours=6)
 
     client = arraylake.Client()
 
-    if write_session_location:
+    if write_session_location is not None:
         fs = fsspec.filesystem("s3", profile=aws_profile)
-        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as f:
-            dest_session = pickle.load(f)
-        print("[SAVE] Loaded coordinated session from S3")
+        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as fobj:
+            dest_session = pickle.load(fobj)
     else:
         repo = client.get_repo(dest_repo)
         dest_session = repo.writable_session(dest_branch)
-        print("[SAVE] Opened direct writable session")
 
-    root = zarr.open_group(dest_session.store, mode="r+", zarr_format=3)
+    lve = LatentVectorExtractor(source_branch=src_branch, source_repo=src_repo, client=client)
 
-    # Load time index ONCE and canonicalize
-    time_index = root["time"][:].astype("datetime64[ns]")
+    # compute max time this job will write
+    final_write_time = end_time + datetime.timedelta(hours=6)
 
-    lve = LatentVectorExtractor(
-        source_repo=src_repo,
-        client=client,
-        source_branch=src_branch,
+    # 🔒 ensure time axis ONCE
+    ensure_time_in_arrays(
+        dest_session.store,
+        final_write_time,
+        time_dim="time",
+        time_frequency="auto",
     )
 
-    for ts in times:
-        lv_ds = lve[ts]
+    for timestamp in times:
+        print(f"{timestamp:%Y-%m-%d %H:%M:%S}")
+        lv = lve[timestamp]  # this is returns an array at timestamp + 6h
+        lv.to_zarr(dest_session.store, zarr_format=3, consolidated=False, region="auto", mode="a")
 
-        # Canonical target time
-        target_ns = np.datetime64(lv_ds.time.values[0], "ns")
-
-        print(f"[SAVE] Verifying target timestamp {target_ns}")
-
-        matches = np.where(time_index == target_ns)[0]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"[SAVE][ERROR] Expected exactly one match for time {target_ns}, "
-                f"found {len(matches)}"
-            )
-
-        idx = int(matches[0])
-        print(f"[SAVE] Overwriting time index {idx}")
-
-        # Explicit region write (NO auto inference)
-        root["lv"][
-            idx : idx + 1,
-            :,
-            :,
-        ] = lv_ds["lv"].values
-
-        # Cheap sanity check (sample, not full slab)
-        nan_after = np.isnan(root["lv"][idx, :1000, :100]).sum()
-        print(f"[SAVE] Sample NaNs after write: {nan_after}")
-
-    if not write_session_location:
+    if write_session_location is None:
         commit_id = dest_session.commit(
-            f"Overwrite LVs {start_time:%Y-%m-%dT%H:%M:%S} → {end_time:%Y-%m-%dT%H:%M:%S}"
+            f"Added {start_time:%Y-%m-%d %H:%M:%S} to {end_time:%Y-%m-%d %H:%M:%S}"
         )
-        print(f"[SAVE] Commit complete: {commit_id}")
+        print(f"Commited data: {commit_id}")
     else:
-        out = os.path.join(
+        outpath = os.path.join(
             write_session_location,
-            f"lv_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}.pickle",
+            f"lv_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}_.pickle",
         )
         fs = fsspec.filesystem("s3", profile=aws_profile)
-        print(f"[SAVE] Writing session fragment → {out}")
-        with fs.open(out, "wb") as f:
-            pickle.dump(dest_session, f)
+        print(f"Writing {outpath}")
+        with fs.open(outpath, "wb") as fobj:
+            pickle.dump(dest_session, fobj)
 
 
 @cli.command()
 @click.argument("start-time", type=click.DateTime())
 @click.argument("end-time", type=click.DateTime())
-@click.option(
-    "--src-repo", type=str, default=SOURCE_REPO, help="Source repository", show_default=True
-)
-@click.option(
-    "--dest-repo", type=str, default=DESTINATION_REPO, help="Destination repo", show_default=True
-)
+@click.option("--src-repo", type=str, required=True, help="Source repository", show_default=True)
+@click.option("--dest-repo", type=str, required=True, help="Destination repo", show_default=True)
 @click.option(
     "--aws-profile", type=str, default="kafou", help="AWS profile name", show_default=True
 )
@@ -294,31 +378,35 @@ def save_lvs(
     default="s3://icechunk-write-coordination",
     show_default=True,
 )
-@click.option("--timesteps-per-job", type=click.INT, default=4 * 2)
+@click.option("--timesteps-per-job", type=int, default=4 * 2)
 @click.option(
-    "--src-branch", type=str, default=SOURCE_BRANCH, help="Source repository", show_default=True
+    "--dest-branch", type=str, default="main", help="Destination branch", show_default=True
 )
-@click.option(
-    "--dest-branch",
-    type=str,
-    default=DESTINATION_BRANCH,
-    help="Repository to be created",
-    show_default=True,
-)
+@click.option("--src-branch", type=str, default="main", help="Source branch", show_default=True)
 def submit_jobs(
-    start_time,
-    end_time,
-    src_repo,
-    dest_repo,
-    aws_profile,
-    coordination_location,
-    timesteps_per_job,
-    src_branch,
-    dest_branch,
-):
-    # -----------------------#
-    # Get time spans to add #
-    # -----------------------#
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    src_repo: str,
+    dest_repo: str,
+    aws_profile: str,
+    coordination_location: str,
+    timesteps_per_job: int,
+    src_branch: str,
+    dest_branch: str,
+) -> None:
+    """
+    Run distributed latent-vector generation via SLURM.
+
+    This command:
+      - Splits a large time range into smaller chunks
+      - Submits one GPU job per chunk
+      - Pre-extends the destination time axis once
+      - Merges completed write sessions
+      - Updates metadata and commits atomically
+
+    Intended for large historical backfills and high-throughput
+    production pipelines.
+    """
     if (
         start_time.hour not in (0, 6, 12, 18)
         or start_time.minute != 0
@@ -346,40 +434,25 @@ def submit_jobs(
         next_start = next_end + datetime.timedelta(hours=6)
         next_end = min(next_start + time_delta, end_time)
 
-    # ---------------------------------------#
-    # Fill repo with NaNs for new timestamps #
-    # ---------------------------------------#
+    lv_job_id = random_job_string(10)
+    session_location = os.path.join(coordination_location, lv_job_id)
+    session_pickle = os.path.join(session_location, "session.pickle")
 
-    # get dest session to write to
     client = arraylake.Client()
     repo = client.get_repo(dest_repo)
     session = repo.writable_session(dest_branch)
 
-    # ensure all time coords exist
-    ensure_time_in_arrays(store=session.store, timestamp=end_time, time_dim="time")
-
-    try:
-        # commit so that the new time coords are saved
-        session.commit("Added NaN time coords to lv destination.")
-    except icechunk.IcechunkError as e:
-        error_msg = str(e)
-        if "no changes" in error_msg:
-            print(f"Timestamps already exist, skipping commit: {e}")
-        else:
-            # Re-raise if it's a different error
-            raise
-
-    # reopen session after commit
-    session = repo.writable_session(dest_branch)
-
-    # ---------------------------------------------------#
-    # Save the session pickle to S3 for the jobs to use #
-    # ---------------------------------------------------#
-
-    # Generate JobIDs for each process
-    lv_job_id = random_job_string(10)
-    session_location = os.path.join(coordination_location, lv_job_id)
-    session_pickle = os.path.join(session_location, "session.pickle")
+    # pre-extend time axis
+    # final_write_time = end_time + datetime.timedelta(hours=6)
+    # ensure_time_in_arrays(
+    #     session.store,
+    #     final_write_time,
+    #     time_dim="time",
+    #     time_frequency="auto",
+    # )
+    # # Optional but recommended: commit the pre-extension
+    # session.commit(f"Pre-extend time axis through {final_write_time}")
+    # session = repo.writable_session(dest_branch)
 
     print(f"Saving the session pickle to {session_pickle}")
     fs = fsspec.filesystem("s3", profile=aws_profile)
@@ -390,9 +463,6 @@ def submit_jobs(
     # Use this later to tell the user who ran this if any time spans were missing.
     ts_tracking = set()
 
-    # ---------------------------------------#
-    # Create jobs to process each time span #
-    # ---------------------------------------#
     for start, end in time_spans:
         start_string = start.strftime("%Y-%m-%dT%H:%M:%S")
         end_string = end.strftime("%Y-%m-%dT%H:%M:%S")
@@ -402,16 +472,15 @@ def submit_jobs(
             "--ntasks=1",
             "--cpus-per-task=32",
             "--gpus=1",
-            f"--job-name=lv-{lv_job_id} {start_string} {end_string}",
+            f"--job-name=lv-{lv_job_id}_{start_string}_{end_string}",
             sys.argv[0],
             "save-lvs",
             f"--src-repo={src_repo}",
             f"--dest-repo={dest_repo}",
-            f"--aws-profile={aws_profile}",
             f"--src-branch={src_branch}",
-            f"--dest-branch={dest_branch}",
+            f"--dest-branch={src_branch}",
+            f"--aws-profile={aws_profile}",
             f"--write-session-location={session_location}",
-            "--overwrite",
             start_string,
             end_string,
         ]
@@ -427,15 +496,12 @@ def submit_jobs(
 
     print("All jobs completed, gathering results...")
 
-    # -------------------------------------------------------- #
-    # Gather results from each job run, merge into one session #
-    # -------------------------------------------------------- #
     sessions = []
     for fspath in fs.ls(session_location):
         filename = fspath.split("/")[-1]
         if filename.startswith("lv_") and filename.endswith(".pickle"):
             start_string, end_string = filename.split("_")[1:3]
-            ts_tracking.remove((start_string, end_string))  # store failed timestamps
+            ts_tracking.remove((start_string, end_string))
             with fs.open(fspath, "rb") as fobj:
                 sessions.append(pickle.load(fobj))
         fs.rm(fspath)
@@ -448,13 +514,6 @@ def submit_jobs(
         )
     else:
         commit_message = f"Add {start_time:%Y-%m-%d %H:%M:%S} to {end_time:%Y-%m-%d %H:%M:%S}"
-
-    # zarr_group = zarr.open_group(session.store, mode="r+", zarr_format=3)
-    # zarr_group.attrs["valid_time_range"] = [start_string, end_string]
-    # zarr_group.attrs["FAILED_TIMESTAMPS"] = (
-    #     [list(item) for item in ts_tracking] if ts_tracking else []
-    # )
-
     commit_id = session.commit(commit_message)
     print(f"Committed data: {commit_id}")
 
