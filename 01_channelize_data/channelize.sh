@@ -5,9 +5,9 @@ START="$1"
 END="$2"
 TOKEN="$3"
 
-SRC_REPO="rwe/era5-0p25-6h-nonprod-ohio"
-DEST_REPO="kafou/aurora-era5-samples"
-DEST_BRANCH="extend-2025"
+SRC_REPO="rwe/model-ecmwf-t0-nonprod-frankfurt"
+DEST_REPO="kafou/aurora-ecmwf-samples"
+DEST_BRANCH="main"
 DAYS_AT_ONCE=1
 
 MAX_RETRIES=100
