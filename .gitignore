@@ -38,3 +38,5 @@ mlruns/
 *.out
 
 mlrun/
+
+*.zarr/
