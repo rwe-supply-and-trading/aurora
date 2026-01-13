@@ -603,8 +603,6 @@ def submit_jobs(
 
     repo = client.get_repo(dst_repo)
 
-    # EXTEND TIME ONCE (CRITICAL)
-    print(f"[SUBMIT] Ensuring time axis through {end_time}")
     # Open source once (for batch planning + time extension)
     sfc_ds, _, _ = open_src_datasets(
         src_repo=src_repo,
@@ -616,6 +614,9 @@ def submit_jobs(
     start_time, end_time = get_clamped_time_range(
         ds=sfc_ds, start_time=start_time, end_time=end_time
     )
+
+    # EXTEND TIME ONCE (CRITICAL)
+    print(f"[SUBMIT] Ensuring time axis through {end_time}")
 
     base_session = repo.writable_session(dst_branch)
     ensure_time_in_arrays(
