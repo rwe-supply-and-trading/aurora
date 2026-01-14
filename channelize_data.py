@@ -19,7 +19,7 @@ from icechunk.distributed import merge_sessions
 # GLOBAL VARIABLES #
 # -----------------#
 # Ensure unbuffered output for real-time logging
-# I could use python -u or use logging instead, but this works for now i suppose
+# I could use python -u or use logging instead, but this works for now
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 READ_RETRIES = 6
@@ -45,9 +45,9 @@ NAME_MAP = {
 }
 
 
-# ---------------#
-# LOGIC HELPERS #
-# ---------------#
+# --------#
+# HELPERS #
+# --------#
 def get_clamped_time_range(
     *,
     ds: xr.Dataset,
@@ -56,7 +56,6 @@ def get_clamped_time_range(
 ) -> tuple[datetime.datetime, datetime.datetime]:
     """
     Clamp (start_time, end_time) to the available time range in ds.
-
     Raises if start_time is entirely outside the dataset.
     """
     time_coord = ds[next(c for c in ds.coords if np.issubdtype(ds[c].dtype, np.datetime64))]
@@ -201,7 +200,11 @@ def get_variable_locations(n_pressure_levels: int = 13) -> tuple[dict, dict]:
 
 
 def init_store(
-    store: zarr.abc.store.Store, *, sfc_ds: xr.Dataset, pl_ds: xr.Dataset, inv_ds: xr.Dataset
+    store: zarr.abc.store.Store,
+    *,
+    sfc_ds: xr.Dataset,
+    pl_ds: xr.Dataset,
+    inv_ds: xr.Dataset,
 ) -> None:
     """
     Initialize the destination Zarr layout.
@@ -216,17 +219,11 @@ def init_store(
     Assumes:
       - time is 6-hourly
       - channel layout is fixed for the lifetime of the store
-
-    Notes:
-    This function is DESTRUCTIVE and MUST only be called on an empty schema.
-    Caller is responsible for enforcing --force-init semantics.
     """
     print("Initializing destination store...")
-    time_chunk, lat_chunk, lon_chunk = 1, 103, 72
 
     # Invariant fields
     print("  • Writing 'invariant' group...")
-    # Select just the invariant variables we want and rename them appropriately.
     inv_ds = inv_ds[["Z", "LSM", "SLT"]]
     inv_ds = inv_ds.rename(NAME_MAP["inv"])
     inv_ds.to_zarr(store, group="invariant", zarr_format=3, consolidated=False, mode="a")
@@ -244,6 +241,7 @@ def init_store(
 
     # Samples coordinates
     print("  • Writing 'samples' coordinates...")
+    time_chunk, lat_chunk, lon_chunk = 1, 103, 72
     coords_ds = xr.Dataset(
         data_vars={
             "atmos_levels": ("atmos_levels", levels),
@@ -285,7 +283,6 @@ def init_store(
 
     # TODO: tune chunking strategy ??
     # we want to store in 1 MB chunks to optimize for read performance
-    # https://rwe-rwest.atlassian.net/wiki/spaces/RAL/pages/717258919/Info+Optimal+Chunking+Strategies+for+Gridded+Zarr+Data+in+Arraylake
     group.create_array(
         "sample_data",
         shape=(time_len, n_channels, lat_len, lon_len),
@@ -300,6 +297,18 @@ def init_store(
     print("Initialization complete.")
 
 
+def get_batches(ds: xr.Dataset, start: datetime.datetime, end: datetime.datetime, n: int = 1):
+    """
+    Generate batches of timestamps from ds between start and end, n at a time.
+    """
+    step = datetime.timedelta(hours=6)
+    cur = start
+    while cur <= end:
+        nxt = min(cur + step * (n - 1), end)
+        yield [cur + i * step for i in range(int((nxt - cur) / step) + 1)]
+        cur = nxt + step
+
+
 def channelize_batch(
     *,
     store: zarr.abc.store.Store,
@@ -311,24 +320,15 @@ def channelize_batch(
     Process one batch and region-write its data
     into an existing Zarr samples store.
 
-    - Loads surface and pressure-level data
+    - Loads surface and pressure-level data from store
     - Builds a dense (time, channel, lat, lon) block
     - Writes ONLY `samples/sample_data` using coordinate-based region writes
     - Pressure-level variables are flattened across levels into channels
-    - Time dimension is extended if needed via `ensure_time_in_arrays()`
-    - Existing timestamps are intentionally overwritten (idempotent)
-
-    Assumptions
-    -----------
-    - Destination store and schema already exist
-    - Channel layout matches `NAME_MAP` / `get_variable_locations()`
+    - Existing timestamps are intentionally overwritten.
     """
-
-    # 1) Slice day: 00Z → 18Z
     print(f"\n=== PROCESSING {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d} ===")
 
-    sfc_vars = list(NAME_MAP["sfc"])
-    pl_vars = list(NAME_MAP["pl"])
+    sfc_vars, pl_vars = list(NAME_MAP["sfc"]), list(NAME_MAP["pl"])
 
     # Read batch with retries catch Icechunk streaming, S3 stalls, network issues, etc.
     for attempt in range(1, READ_RETRIES + 1):
@@ -376,7 +376,7 @@ def channelize_batch(
         },
     )
 
-    # 4) Region write by coordinate labels
+    # Region writes
     write_ds.to_zarr(
         store,
         group="samples",
@@ -387,23 +387,6 @@ def channelize_batch(
 
     print(f"   ✔ Finished writing batch {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d}.")
     return write_ds
-
-
-def get_batches(ds: xr.Dataset, start: datetime.datetime, end: datetime.datetime, n: int = 1):
-    """
-    Generate batches of timestamps from ds between start and end, n at a time.
-    """
-    step = datetime.timedelta(hours=6)
-    cur = start
-    while cur <= end:
-        nxt = min(cur + step * (n - 1), end)
-        yield [cur + i * step for i in range(int((nxt - cur) / step) + 1)]
-        cur = nxt + step
-
-
-# ----------------#
-# SCRIPT HELPERS #
-# ----------------#
 
 
 def get_or_create_repo_branch(
@@ -461,11 +444,11 @@ def get_job_count(job_prefix: str) -> int:
     return sum(1 for name in res.stdout.splitlines() if name.startswith(job_prefix))
 
 
-def finalize_metadata(
+def set_metadata(
     *,
     session,
-    start_time: datetime.datetime,
-    end_time: datetime.datetime,
+    start_time: datetime.datetime | None = None,
+    end_time: datetime.datetime | None = None,
     extra: dict | None = None,
 ) -> None:
     root = zarr.open_group(session.store, group="samples", zarr_format=3)
@@ -478,12 +461,16 @@ def finalize_metadata(
             min(old[0], start_time.isoformat()),
             max(old[1], end_time.isoformat()),
         ]
+    elif start_time is None and end_time is None:
+        attrs["valid_times"] = [
+            None,
+            None,
+        ]
     else:
         attrs["valid_times"] = [
             start_time.isoformat(),
             end_time.isoformat(),
         ]
-    attrs["created_by"] = "Zora Zorkic"
     attrs["last_updated"] = datetime.datetime.utcnow().isoformat()
 
     if extra:
@@ -523,7 +510,7 @@ def channelize_worker(
     times_at_once: int,
     aws_profile: str,
     token: str | None,
-):
+) -> None:
     client = arraylake.Client(token=token)
     if token is None and src_repo.startswith("rwe/"):
         client.login()
@@ -591,16 +578,15 @@ def submit_jobs(
 
     Contract:
       - init_store MUST already have been run
-      - time axis is extended ONCE here
+      - time axis is extended ONCE here before submitting jobs
       - workers only write data
-      - final merge + commit is atomic
+      - final merge + commit is atomic, so a driver script is recomended
     """
 
-    # Client + repo
+    # Get repo
     client = arraylake.Client(token=token)
     if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
         client.login()
-
     repo = client.get_repo(dst_repo)
 
     # Open source once (for batch planning + time extension)
@@ -615,7 +601,7 @@ def submit_jobs(
         ds=sfc_ds, start_time=start_time, end_time=end_time
     )
 
-    # EXTEND TIME ONCE (CRITICAL)
+    # Extend time axis for new data
     print(f"[SUBMIT] Ensuring time axis through {end_time}")
 
     base_session = repo.writable_session(dst_branch)
@@ -645,7 +631,6 @@ def submit_jobs(
     # Submit SLURM jobs
     job_prefix = f"chan-{run_id}"
     expected = set()
-
     print(f"[SUBMIT] Submitting {len(batches)} SLURM jobs ({times_at_once} timesteps per job)")
 
     for batch in batches:
@@ -700,11 +685,12 @@ def submit_jobs(
         with fs.open(path, "rb") as f:
             sessions.append(pickle.load(f))
         fs.rm(path)
-
     merged_session = merge_sessions(base_session, *sessions)
 
+    # Add Metadata
+    set_metadata(session=merged_session, start_time=start_time, end_time=end_time)
+
     # Commit
-    finalize_metadata(session=merged_session, start_time=start_time, end_time=end_time)
     msg = f"channelize {start_time.isoformat()} → {end_time.isoformat()}"
     commit_id = commit_with_retries(session=merged_session, msg=msg)
     print(f"[SUBMIT] Commit complete: {commit_id}")
@@ -731,6 +717,14 @@ def init(
     token: str,
     force_init: bool = False,
 ) -> None:
+    """
+    Initializes channelized repository.
+
+    - Opens and cleans source datasets
+    - Gets and/or created new repo and branch
+    - You may elect to force overwriting of an old repo using force_init flag
+    - Adds metadata and commits
+    """
     client = arraylake.Client(token=token)
     if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
         client.login()
@@ -749,8 +743,9 @@ def init(
         branch_name=dst_branch,
         base_branch="main",
     )
-
     root = zarr.open_group(session.store, mode="a")
+
+    # Check for existing schema, Delete if forced
     if force_init:
         print("⚠️  --force-init enabled: deleting existing schema")
         for key in ("samples", "invariant"):
@@ -764,7 +759,7 @@ def init(
                 "If you REALLY want to destroy and recreate it, re-run with --force-init."
             )
 
-    # Initialize layout (MUST be idempotent)
+    # Initialize layout
     init_store(
         session.store,
         sfc_ds=sfc_ds,
@@ -772,6 +767,10 @@ def init(
         inv_ds=inv_ds,
     )
 
+    # Add Metadata
+    set_metadata(session=session, start_time=None, end_time=None)
+
+    # Commit
     commit_id = commit_with_retries(session=session, msg="Initialized sample data store.")
     print(f"✓ Initialized; commit_id={commit_id}")
 
