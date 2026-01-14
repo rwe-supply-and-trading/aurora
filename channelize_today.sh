@@ -10,19 +10,19 @@ set -euo pipefail
 #     main \ 
 #     kafou/aurora-era5-samples \
 #     main \
-#     $ARRAYLAKE_TOKEN
+#     $ARRAYLAKE_TOKEN 
 # -----------------------------
 
 START_TIME="$1"
 END_TIME="$2"
-TOKEN="$3"
-SRC_REPO="$4"
-SRC_BRANCH="$5"
-DST_REPO="$6"
-DST_BRANCH="$7"
+SRC_REPO="$3"
+SRC_BRANCH="$4"
+DST_REPO="$5"
+DST_BRANCH="$6"
+TOKEN="$7"
 
 if [[ -z "${START_TIME:-}" || -z "${END_TIME:-}" || -z "${TOKEN:-}" ]]; then
-  echo "Usage: $0 START_TIME END_TIME TOKEN"
+  echo "Usage: $0 START_TIME END_TIME SRC_REPO SRC_BRANCH DST_REPO DST_BRANCH TOKEN"
   exit 1
 fi
 
