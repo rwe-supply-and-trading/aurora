@@ -34,3 +34,9 @@ checkpoints/
 mlflow_tmp/
 aurora_mlflow_pyfunc/
 mlruns/
+
+*.out
+
+mlruns/
+
+*.zarr/
