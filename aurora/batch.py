@@ -189,6 +189,28 @@ class Batch:
         """Convert everything to type `t`."""
         return self._fmap(lambda x: x.type(t))
 
+    def requires_grad_(self, requires_grad: bool = True) -> "Batch":
+        """Enable or disable gradient tracking on surface and atmospheric variable tensors.
+
+        This is useful for inverse problems where you want to compute gradients
+        with respect to the initial state.
+
+        Note:
+            Static variables (topography, land-sea mask, etc.) are not affected by this
+            method since they typically don't need gradients.
+
+        Args:
+            requires_grad: Whether to enable or disable gradient tracking.
+
+        Returns:
+            The batch with gradient tracking enabled/disabled on variable tensors.
+        """
+        for v in self.surf_vars.values():
+            v.requires_grad_(requires_grad)
+        for v in self.atmos_vars.values():
+            v.requires_grad_(requires_grad)
+        return self
+
     def regrid(self, res: float) -> "Batch":
         """Regrid the batch to a `res` degrees resolution.
 
