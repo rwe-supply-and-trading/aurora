@@ -1,83 +1,5 @@
 #!/usr/bin/env python
 
-"""
-Aurora Latent Forecast Writer (ERA5 → Zarr / Icechunk)
-
-This script generates Aurora *forecast* latent vectors from ERA5 inputs and
-stores them in a Zarr v3 dataset backed by Icechunk. It supports both single-job
-execution and distributed GPU execution via SLURM, with safe concurrent region
-writes and a final atomic merge + commit.
-
-For each 6-hourly ERA5 initialization time `t`, the Aurora model performs a
-multi-step rollout and writes latent forecasts at:
-
-    t + 6h, t + 12h, ..., t + 6h * rollout_steps
-
-These are stored in a 4D array:
-
-    latent_forecast(init_time, lead_time, spatial_location, feature)
-
-The temporal offset semantics (`init_time → valid_time = init_time + lead_time`)
-are intentional and centralized in `LatentVectorExtractor`.
-
-The store is initialized *once* with coordinates and metadata only; the dense
-latent array is created empty and incrementally filled via region writes.
-
-Main commands
--------------
-init
-  Initialize a new latent-forecast repository with coordinates and an empty
-  `latent_forecast` array. Must be run exactly once per destination repo/branch.
-
-save-lvs
-  Run Aurora inference for a contiguous range of `init_time` values and write
-  forecast cubes directly into the store using region writes.
-
-submit-jobs
-  Split a large time range into disjoint SLURM jobs, run `save-lvs` in parallel
-  on GPUs, merge all write sessions, and commit once atomically.
-
-Dataset invariants
-------------------
-- Writes are indexed by `init_time`; each job writes disjoint slices.
-- `valid_time = init_time + lead_time` is stored explicitly.
-- The root attribute `valid_time_range` is monotonic and tracks temporal
-  coverage of successfully written data.
-
-Intended use
-------------
-- Large-scale historical backfills
-- Incremental operational updates
-- HPC / SLURM environments with shared object storage
-
-
-
-To Run
-------
-tmux
-
-conda activate aurora
-
-
-sbatch   --ntasks=1   --cpus-per-task=32   --mem=300G   --job-name=lv-submit   --wrap='
-    python latent_forecast_writer.py submit-jobs \
-      2025-07-01T00:00:00 \
-      2025-07-31T18:00:00 \
-      --src-repo kafou/aurora-era5-samples \
-      --src-branch extend-2025 \
-      --dest-repo kafou/aurora-era5-forecast-latent-vectors-july-v2 \
-      --dest-branch main \
-      --aws-profile kafou \
-      --timesteps-per-job 8 \
-      --coordination-location s3://icechunk-write-coordination'
-
-"""
-
-import os
-
-os.environ["PYTHONUNBUFFERED"] = "1"
-
-
 import datetime
 import os
 import pickle
@@ -88,22 +10,71 @@ import time
 
 import click
 import fsspec
+import icechunk
 import kafou_arraylake as arraylake
 import numpy as np
 import torch
 import xarray as xr
 import zarr
+from dataset_io import ensure_time_in_arrays
 from icechunk.distributed import merge_sessions
 
 from aurora import AuroraPretrained
 from aurora.data import ERA5DataLoaderFOAM
 from aurora.rollout import rollout_with_latents
 
-SOURCE_REPO = "kafou/aurora-era5-samples"
-SOURCE_BRANCH = "extend-2025"
+os.environ["PYTHONUNBUFFERED"] = "1"
 
-DESTINATION_REPO = "kafou/aurora-era5-forecast-latent-vectors"
-DESTINATION_BRANCH = "main"
+
+def get_batches(start_time: datetime.datetime, end_time: datetime.datetime, n: int = 1):
+    """
+    Generate batches of timestamps from ds between start_time and end_time, n at a time.
+    """
+    step = datetime.timedelta(hours=6)
+    cur = start_time
+    while cur <= end_time:
+        nxt = min(cur + step * (n - 1), end_time)
+        yield [cur + i * step for i in range(int((nxt - cur) / step) + 1)]
+        cur = nxt + step
+
+
+def get_clamped_time_range(
+    ds: xr.Dataset,
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """
+    Clamp (start_time, end_time) to the available time range in ds.
+    Raises if start_time is entirely outside the dataset.
+    """
+    # time_coord = ds[next(c for c in ds.coords if np.issubdtype(ds[c].dtype, np.datetime64))]
+
+    # src_end = (
+    #     time_coord.isel({time_coord.dims[0]: -1})
+    #     .item()
+    #     .astype("datetime64[ns]")
+    #     .astype(datetime.datetime)
+    # )
+
+    # print(start_time)
+    # print(f"What data type is start_time? {type(start_time)}")
+    # print(src_end)
+    # print(f"What data type is src_end? {type(src_end)}")
+    # if start_time > src_end:
+    #     raise RuntimeError(
+    #         f"start_time={start_time.isoformat()} is after last available "
+    #         f"source timestamp={src_end.isoformat()}"
+    #     )
+
+    # clamped_end = min(end_time, src_end)
+
+    # if clamped_end < end_time:
+    #     print(
+    #         f"[SUBMIT] Clamping end_time → {clamped_end.isoformat()} "
+    #         f"(source max={src_end.isoformat()})"
+    #     )
+
+    return start_time, end_time
 
 
 def random_job_string(length: int = 8) -> str:
@@ -124,6 +95,52 @@ def get_job_count(job_prefix: str) -> int:
     return sum(1 for name in res.stdout.splitlines() if name.startswith(job_prefix))
 
 
+def commit_with_retries(session, msg: str, max_attempts: int = 6):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return session.commit(msg)
+        except (RuntimeError, icechunk.IcechunkError):
+            if attempt == max_attempts:
+                raise
+            time.sleep(2**attempt)
+
+
+def set_metadata(
+    *,
+    session,
+    start_time: datetime.datetime | None = None,
+    end_time: datetime.datetime | None = None,
+    extra: dict | None = None,
+) -> None:
+    root = zarr.open_group(session.store, zarr_format=3)
+
+    attrs = dict(root.attrs)
+
+    old = attrs.get("valid_times")
+    if old:
+        attrs["valid_times"] = [
+            min(old[0], start_time.isoformat()),
+            max(old[1], end_time.isoformat()),
+        ]
+    elif start_time is None and end_time is None:
+        attrs["valid_times"] = [
+            None,
+            None,
+        ]
+    else:
+        attrs["valid_times"] = [
+            start_time.isoformat(),
+            end_time.isoformat(),
+        ]
+    attrs["last_updated"] = datetime.datetime.now().isoformat()
+
+    if extra:
+        attrs.update(extra)
+
+    root.attrs.clear()
+    root.attrs.update(attrs)
+
+
 def get_spatial_indices_from_bounds(
     *,
     lat_range: tuple[float, float],
@@ -131,6 +148,7 @@ def get_spatial_indices_from_bounds(
     n_lev: int = 4,
     n_lat: int = 180,
     n_lon: int = 360,
+    expected_spatial: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Return flat spatial_location indices for a lat/lon bounding box.
@@ -146,28 +164,19 @@ def get_spatial_indices_from_bounds(
     lat_min, lat_max = lat_range
     lon_min, lon_max = lon_range
 
-    # ------------------------------------------------------------------
     # Coordinate grids (centers)
-    # ------------------------------------------------------------------
-
     lat_vals = np.linspace(89.5, -89.5, n_lat)  # north → south
     lon_vals_0360 = np.linspace(0.5, 359.5, n_lon)  # 0–360
     lon_vals = ((lon_vals_0360 + 180) % 360) - 180  # −180…180
 
-    # ------------------------------------------------------------------
     # Latitude mask
-    # ------------------------------------------------------------------
-
     lat_mask = (lat_vals >= lat_min) & (lat_vals <= lat_max)
     lat_idx = np.where(lat_mask)[0]
 
     if lat_idx.size == 0:
         raise ValueError("Latitude range selects no grid points.")
 
-    # ------------------------------------------------------------------
     # Longitude mask (wrap-aware)
-    # ------------------------------------------------------------------
-
     if lon_min <= lon_max:
         lon_mask = (lon_vals >= lon_min) & (lon_vals <= lon_max)
     else:
@@ -183,16 +192,56 @@ def get_spatial_indices_from_bounds(
     # (fixes visual seam issues when crossing 0°)
     lon_idx = lon_idx[np.argsort(lon_vals[lon_idx])]
 
-    # ------------------------------------------------------------------
     # Build flat spatial_location indices
     # lev-major, then lat, then lon
-    # ------------------------------------------------------------------
-
     spatial_indices = np.concatenate(
         [lev * n_lat * n_lon + lat * n_lon + lon_idx for lev in range(n_lev) for lat in lat_idx]
     ).astype(np.int64)
 
+    spatial_indices = spatial_indices.astype(np.int64)
+
+    if expected_spatial is not None:
+        expected_spatial = expected_spatial.astype(np.int64)
+        if not np.array_equal(expected_spatial, spatial_indices):
+            raise RuntimeError(
+                "Spatial indices derived from lat/lon bounds do not match "
+                "the destination store.\n"
+                "Did you run `init` with the same spatial bounds?"
+            )
+
     return spatial_indices
+
+
+def get_or_create_repo_branch(
+    *,
+    client: arraylake.Client,
+    repo_name: str,
+    branch_name: str,
+    base_branch: str = "main",
+):
+    """
+    Open an Arraylake repo and branch, creating them if they do not exist.
+    """
+    # Repo
+    try:
+        repo = client.get_repo(repo_name)
+        print(f"✓ Opened existing repo: {repo_name}")
+    except Exception:
+        repo = client.create_repo(repo_name)
+        print(f"✓ Created new repo: {repo_name}")
+
+    # Branch
+    branches = repo.list_branches()
+    if branch_name not in branches:
+        print(f"Branch '{branch_name}' does not exist — creating from '{base_branch}'")
+        base_commit = repo.lookup_branch(base_branch)
+        repo.create_branch(branch_name, base_commit)
+    else:
+        print(f"✓ Branch '{branch_name}' already exists")
+
+    # Writable session
+    session = repo.writable_session(branch_name)
+    return repo, session
 
 
 class LatentVectorExtractor:
@@ -209,7 +258,7 @@ class LatentVectorExtractor:
     def __init__(
         self,
         *,
-        source_repo: str = SOURCE_REPO,
+        source_repo: str | None = None,
         client: arraylake.Client | None = None,
         source_branch: str = "main",
         device: str = "cuda",
@@ -270,7 +319,6 @@ class LatentVectorExtractor:
                 lvs.append(latent_np)
 
         lv_arr = np.stack(lvs, axis=0).astype("float32", copy=False)
-        # shape: (lead_time, spatial_location, feature)
 
         lead_time = np.arange(1, steps + 1, dtype="int64") * 6
 
@@ -291,12 +339,51 @@ class LatentVectorExtractor:
         return out
 
 
-@click.group()
-def cli():
-    pass
+def build_init_times(
+    start_time,
+    end_time,
+    init_hour: int | None = None,
+    step_hours: int = 6,
+) -> np.ndarray:
+    """
+    Build a canonical, validated init_time axis.
+
+    This is the ONLY place where init_times are constructed or filtered.
+    """
+    # Normalize inputs
+    start_time = np.datetime64(start_time, "ns")
+    end_time = np.datetime64(end_time, "ns")
+
+    if start_time > end_time:
+        raise ValueError("start_time must be <= end_time")
+
+    if init_hour is not None and init_hour not in (0, 6, 12, 18):
+        raise ValueError("init_hour must be one of 0, 6, 12, 18")
+
+    # Build full grid
+    times = np.arange(
+        start_time,
+        end_time + np.timedelta64(step_hours, "h"),
+        np.timedelta64(step_hours, "h"),
+        dtype="datetime64[ns]",
+    )
+
+    # Optional hour filter
+    if init_hour is not None:
+        hours = times.astype("datetime64[h]").astype(int) % 24
+        times = times[hours == init_hour]
+
+    # Final validation
+    if times.size == 0:
+        raise ValueError("No init_times remain after filtering.")
+
+    if not np.all(np.diff(times) >= np.timedelta64(0, "ns")):
+        raise ValueError("init_times must be monotonic")
+
+    return times
 
 
-def init_forecast_zarr_store(
+def init_store(
     *,
     store,
     init_times: np.ndarray,
@@ -307,17 +394,31 @@ def init_forecast_zarr_store(
     """
     Initialize forecast store with coords + empty `lv`.
 
-    Assumes init_times is already validated, monotonic,
-    and dtype datetime64[ns].
+    Creates:
+        Dimensions:         (feature, init_time, lead_time, spatial_location)
+        Coordinates:
+            * feature       (feature) int64
+            * init_time     (init_time) datetime64[ns]
+            * lead_time     (lead_time) int64
+            valid_time      (init_time, lead_time) datetime64[ns]
+            * spatial_location  (spatial_location) int64
+        Data variables:
+            lv              (init_time, lead_time, spatial_location, feature) float32
     """
+    print("[INIT] Initializing destination store...")
 
     n_feature = 1024
 
-    # --------------------------------------------------
     # Spatial handling
-    # --------------------------------------------------
-
-    if lat_range and lon_range:
+    if (
+        lat_range is not None
+        and lon_range is not None
+        and lat_range[0] is not None
+        and lat_range[1] is not None
+        and lon_range[0] is not None
+        and lon_range[1] is not None
+    ):
+        print(f"[INIT] Subsetting coordinates to lat=({lat_range}), lon=({lon_range})")
         spatial_coord = get_spatial_indices_from_bounds(
             lat_range=lat_range,
             lon_range=lon_range,
@@ -327,17 +428,12 @@ def init_forecast_zarr_store(
         spatial_coord = np.arange(259200, dtype="int64")
         n_spatial = 259200
 
-    # --------------------------------------------------
     # Lead / valid time
-    # --------------------------------------------------
-
     lead_times = (np.arange(1, rollout_steps + 1) * 6).astype("int64")
     valid_times = init_times[:, None] + lead_times[None, :] * np.timedelta64(1, "h")
 
-    # --------------------------------------------------
     # Coordinate dataset
-    # --------------------------------------------------
-
+    print("[INIT] Writing coordinates...")
     coord_ds = xr.Dataset(
         coords={
             "init_time": ("init_time", init_times),
@@ -347,16 +443,12 @@ def init_forecast_zarr_store(
             "valid_time": (("init_time", "lead_time"), valid_times),
         },
         attrs={
-            "description": "Aurora latent forecast dataset",
+            "description": "Aurora latent vector forecast dataset.",
             "rollout_steps": int(rollout_steps),
-            "valid_time_range": (
-                str(init_times.min()),
-                str(init_times.max()),
-            ),
-            # ---- spatial intent ----
+            "lead_times": lead_times,
             "spatial_subset_type": ("bounding_box" if lat_range and lon_range else "global"),
-            "lat_range_requested": lat_range,
-            "lon_range_requested": lon_range,
+            "lat_range": (lat_range if lat_range and lon_range else None),
+            "lon_range": (lon_range if lat_range and lon_range else None),
         },
     )
 
@@ -375,6 +467,13 @@ def init_forecast_zarr_store(
         },
     )
 
+    # TODO: tune chunking strategy ??
+    # we want to store in 1 MB chunks to optimize for read performance.
+    print("[INIT] Createing lv DataArray...")
+    print(f"      shape  = ({len(init_times)}, {len(lead_times)}, {n_spatial}, {n_feature})")
+    print(f"      chunks = (1, {len(lead_times)}, 1024, 128)")
+
+    compressors = [zarr.codecs.BloscCodec(clevel=3, shuffle=zarr.codecs.BloscShuffle.bitshuffle)]
     zarr.create_array(
         store,
         name="lv",
@@ -382,88 +481,23 @@ def init_forecast_zarr_store(
         chunks=(1, len(lead_times), 1024, 128),
         dtype="float32",
         fill_value=np.nan,
-        compressors=[],
+        compressors=compressors,
         dimension_names=("init_time", "lead_time", "spatial_location", "feature"),
     )
 
-    print("[INIT] wrote coords + empty lv")
+    print("[INIT] Initialization complete.")
 
 
-def build_init_times(
-    *,
-    start_time,
-    end_time,
-    step_hours: int = 6,
-    init_hour: int | None = None,
-    init_time_range: tuple | None = None,
-) -> np.ndarray:
-    """
-    Build a canonical, validated init_time axis.
-
-    This is the ONLY place where init_times are constructed or filtered.
-    """
-
-    # ---------------------------
-    # Normalize inputs
-    # ---------------------------
-
-    start_time = np.datetime64(start_time, "ns")
-    end_time = np.datetime64(end_time, "ns")
-
-    if start_time > end_time:
-        raise ValueError("start_time must be <= end_time")
-
-    if init_hour is not None and init_hour not in (0, 6, 12, 18):
-        raise ValueError("init_hour must be one of 0, 6, 12, 18")
-
-    # ---------------------------
-    # Build full grid
-    # ---------------------------
-
-    times = np.arange(
-        start_time,
-        end_time + np.timedelta64(step_hours, "h"),
-        np.timedelta64(step_hours, "h"),
-        dtype="datetime64[ns]",
-    )
-
-    # ---------------------------
-    # Optional hour filter
-    # ---------------------------
-
-    if init_hour is not None:
-        hours = times.astype("datetime64[h]").astype(int) % 24
-        times = times[hours == init_hour]
-
-    # ---------------------------
-    # Optional bounds filter
-    # ---------------------------
-
-    if init_time_range is not None:
-        t0, t1 = init_time_range
-        t0 = np.datetime64(t0, "ns")
-        t1 = np.datetime64(t1, "ns")
-
-        times = times[(times >= t0) & (times <= t1)]
-
-    # ---------------------------
-    # Final validation
-    # ---------------------------
-
-    if times.size == 0:
-        raise ValueError("No init_times remain after filtering.")
-
-    if not np.all(np.diff(times) >= np.timedelta64(0, "ns")):
-        raise ValueError("init_times must be monotonic")
-
-    return times
+@click.group()
+def cli():
+    pass
 
 
 @cli.command("init")
 @click.argument("start_time", type=click.DateTime())
 @click.argument("end_time", type=click.DateTime())
-@click.option("--dest-repo", required=True, show_default=True)
-@click.option("--dest-branch", default="main", show_default=True)
+@click.option("--dst-repo", required=True, show_default=True)
+@click.option("--dst-branch", default="main", show_default=True)
 @click.option("--src-repo", required=True, show_default=True)
 @click.option("--src-branch", default="main", show_default=True)
 @click.option("--rollout-steps", type=int, default=10, show_default=True)
@@ -471,6 +505,7 @@ def build_init_times(
 @click.option("--lat-max", type=float, default=None)
 @click.option("--lon-min", type=float, default=None)
 @click.option("--lon-max", type=float, default=None)
+@click.option("--force-init", is_flag=True, default=False)
 @click.option(
     "--init-hour",
     type=int,
@@ -480,8 +515,8 @@ def build_init_times(
 def init(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
-    dest_repo: str,
-    dest_branch: str,
+    dst_repo: str,
+    dst_branch: str,
     src_repo: str,
     src_branch: str,
     rollout_steps: int,
@@ -490,6 +525,7 @@ def init(
     lon_min: float | None,
     lon_max: float | None,
     init_hour: int | None,
+    force_init: bool,
 ):
     """
     Initialize latent forecast Zarr store:
@@ -505,190 +541,143 @@ def init(
     * lead_time         (lead_time) int64
     * spatial_location  (spatial_location) int64
     * feature           (feature) int64
-        valid_time        (init_time, lead_time) datetime64[ns]
+      valid_time        (init_time, lead_time) datetime64[ns]
 
     Data variables:
         latent_forecast   (init_time, lead_time, spatial_location, feature) float32
 
     """
+
+    client = arraylake.Client()
+
+    # Get or create destination repo + branch
+    print(f"[INIT] Opening/creating destination repo={dst_repo} branch={dst_branch}")
+    repo, session = get_or_create_repo_branch(
+        client=client,
+        repo_name=dst_repo,
+        branch_name=dst_branch,
+        base_branch="main",
+    )
+
+    # Check for existing schema, Delete if forced
+    root = zarr.open_group(session.store, mode="a")
+    if force_init:
+        print("⚠️  --force-init enabled: deleting existing schema")
+        for key in ("samples", "invariant"):
+            if key in root:
+                del root[key]
+
     init_times = build_init_times(
         start_time=start_time,
         end_time=end_time,
         init_hour=init_hour,
     )
-    client = arraylake.Client()
-
-    # Get repository or create it if it doesn't exist
-    try:
-        dest_repo_obj = client.get_repo(dest_repo)
-        print(f"[INIT] Using existing repo {dest_repo}")
-    except Exception:
-        dest_repo_obj = client.create_repo(dest_repo)
-        print(f"[INIT] Created repo {dest_repo}")
-
-    # Create a writable session
-    session = dest_repo_obj.writable_session(dest_branch)
-
-    lat_range = (lat_min, lat_max)
-    lon_range = (lon_min, lon_max)
 
     # Delegate all real work to helper function
-    init_forecast_zarr_store(
+    init_store(
         store=session.store,
         init_times=init_times,
         rollout_steps=rollout_steps,
-        lat_range=lat_range,
-        lon_range=lon_range,
+        lat_range=(lat_min, lat_max),
+        lon_range=(lon_min, lon_max),
     )
+
+    # Add Metadata
+    set_metadata(session=session, start_time=start_time, end_time=end_time)
 
     # Commit
     commit_id = session.commit("Initialized latent vector store.")
-    print(f"[INIT] Committed: {commit_id} to {dest_repo}:{dest_branch}")
+    print(f"[INIT] Committed: {commit_id} to {dst_repo}:{dst_branch}")
 
     # print what data loks like
     print(xr.open_zarr(session.store, zarr_format=3, consolidated=False, chunks=None))
 
 
-@cli.command("save-lvs")
+@cli.command("lv-worker")
 @click.argument("start_time", type=click.DateTime())
 @click.argument("end_time", type=click.DateTime())
-@click.option("--src-repo", default=SOURCE_REPO, show_default=True)
-@click.option("--src-branch", default=SOURCE_BRANCH, show_default=True)
-@click.option("--dest-repo", default=DESTINATION_REPO, show_default=True)
-@click.option("--dest-branch", default=DESTINATION_BRANCH, show_default=True)
+@click.option("--src-repo", required=True)
+@click.option("--src-branch", required=True)
+@click.option("--dst-repo", required=True)
+@click.option("--dst-branch", required=True)
 @click.option("--write-session-location", type=str, default=None)
 @click.option("--aws-profile", type=str, default="kafou", show_default=True)
-@click.option("--rollout-steps", type=int, default=10, show_default=True)
-@click.option("--lat-min", type=float, default=None)
-@click.option("--lat-max", type=float, default=None)
-@click.option("--lon-min", type=float, default=None)
-@click.option("--lon-max", type=float, default=None)
-@click.option("--init-hour", type=int, default=None)
-def save_lvs(
+def lv_worker(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
     src_repo: str,
     src_branch: str,
-    dest_repo: str,
-    dest_branch: str,
+    dst_repo: str,
+    dst_branch: str,
     write_session_location: str | None,
     aws_profile: str,
-    rollout_steps: int,
-    lat_min: float | None,
-    lat_max: float | None,
-    lon_min: float | None,
-    lon_max: float | None,
-    init_hour: int | None,
 ):
-    # --------------------------------------------------
-    # Canonical init_times (single source of truth)
-    # --------------------------------------------------
-
-    init_times = build_init_times(
-        start_time=start_time,
-        end_time=end_time,
-        init_hour=init_hour,
-    )
-
-    init_times64 = init_times.astype("datetime64[ns]")
-    print(f"[SAVE_LVS] init_times to process: {init_times64}")
-    print(f"[SAVE_LVS] lead_times to process: {np.arange(1, rollout_steps + 1) * 6}")
-
+    print(f"\n=== PROCESSING {start_time:%Y-%m-%d}-{end_time:%Y-%m-%d} ===")
     # --------------------------------------------------
     # Session handling
     # --------------------------------------------------
-
     client = arraylake.Client()
-
     if write_session_location is not None:
         fs = fsspec.filesystem("s3", profile=aws_profile)
-        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as f:
-            dest_session = pickle.load(f)
+        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as fobj:
+            dst_session = pickle.load(fobj)
     else:
-        repo = client.get_repo(dest_repo)
-        dest_session = repo.writable_session(dest_branch)
+        repo = client.get_repo(dst_repo)
+        dst_session = repo.writable_session(dst_branch)
 
     # --------------------------------------------------
-    # Open store + validate coverage
+    # Get Destination Session Store
     # --------------------------------------------------
-
     ds_store = xr.open_zarr(
-        dest_session.store,
+        dst_session.store,
         zarr_format=3,
         consolidated=False,
         chunks=None,
     )
-    root = zarr.open_group(dest_session.store, zarr_format=3)
-    saved_root_attrs = dict(root.attrs)
 
-    store_init = ds_store["init_time"].values.astype("datetime64[ns]")
-    store_lead = ds_store["lead_time"].values.astype("int64")
-
-    # Coverage check (vectorized, once)
-    if init_times64.min() < store_init.min() or init_times64.max() > store_init.max():
-        raise RuntimeError(
-            f"Store init_time coverage {store_init.min()}..{store_init.max()} "
-            f"does not cover requested {init_times64.min()}..{init_times64.max()}. "
-            "Did you run `init` with the same bounds?"
-        )
+    spatial_indices = ds_store.spatial_location.values.tolist()
 
     # --------------------------------------------------
-    # Latent extractor
+    # Get Timestamps ?
     # --------------------------------------------------
+    lead_times = ds_store["lead_time"].values.astype("int64")
+    init_times = (
+        ds_store["init_time"]
+        .sel(init_time=slice(start_time, end_time))
+        .values.astype("datetime64[ns]")
+    )
 
+    init_times = init_times.astype("datetime64[ns]")
+    rollout_steps = len(lead_times)
+    print(f"[lv_worker] init_times to process: {init_times}")
+    print(f"[lv_worker] lead_times to process: {np.arange(1, rollout_steps + 1) * 6}")
+
+    # --------------------------------------------------
+    # Forecast
+    # --------------------------------------------------
     lve = LatentVectorExtractor(
         source_repo=src_repo,
         source_branch=src_branch,
         client=client,
     )
 
-    # --------------------------------------------------
-    # Canonical spatial_indices (for post-inference slicing)
-    # --------------------------------------------------
-
-    if any(v is not None for v in (lat_min, lat_max, lon_min, lon_max)):
-        if None in (lat_min, lat_max, lon_min, lon_max):
-            raise click.ClickException("lat/lon bounds must be complete pairs")
-
-        spatial_indices = get_spatial_indices_from_bounds(
-            lat_range=(lat_min, lat_max),
-            lon_range=(lon_min, lon_max),
-        )
-    else:
-        spatial_indices = None
-
-    store_spatial = ds_store["spatial_location"].values.astype("int64")
-
-    if spatial_indices is not None:
-        if not np.array_equal(store_spatial, spatial_indices):
-            raise RuntimeError(
-                "Spatial indices derived from lat/lon bounds do not match "
-                "the destination store.\n"
-                "Did you run `init` with the same spatial bounds?"
-            )
-
-    # --------------------------------------------------
-    # Write loop
-    # --------------------------------------------------
-
-    for init_time64 in init_times64:
+    for init_time in init_times:
         # ---- full inference (positional spatial axis) ----
         lv_ds = lve.rollout_lvs(
-            item=init_time64.astype("datetime64[s]").item(),
+            item=init_time.astype("datetime64[s]").item(),
             steps=rollout_steps,
         )
 
         # ---- enforce lead_time compatibility ----
         # TODO: This is where we would subset leadtime
-        if not np.array_equal(lv_ds["lead_time"].values.astype("int64"), store_lead):
+        if not np.array_equal(lv_ds["lead_time"].values.astype("int64"), lead_times):
             lv_ds = lv_ds.reindex({"lead_time": ds_store["lead_time"]})
             if lv_ds["lv"].isnull().any():
                 raise ValueError("After reindex, lv contains NaNs — lead_time mismatch.")
 
         # ---- spatial subsetting  ----
         lv_arr = lv_ds["lv"].values  # (lead_time, spatial_location, feature)
-
-        if spatial_indices is not None:
+        if len(spatial_indices) != (4 * 180 * 360):
             lv_arr = lv_arr[:, spatial_indices, :]
 
         # ---- build labeled cube that matches the store exactly ----
@@ -696,7 +685,7 @@ def save_lvs(
             lv_arr[None, ...],
             dims=("init_time", "lead_time", "spatial_location", "feature"),
             coords={
-                "init_time": ("init_time", np.array([init_time64], dtype="datetime64[ns]")),
+                "init_time": ("init_time", np.array([init_time], dtype="datetime64[ns]")),
                 "lead_time": ds_store["lead_time"],
                 "spatial_location": ds_store["spatial_location"],
                 "feature": ds_store["feature"],
@@ -705,7 +694,7 @@ def save_lvs(
         )
 
         lv_da.to_zarr(
-            dest_session.store,
+            dst_session.store,
             zarr_format=3,
             consolidated=False,
             mode="a",
@@ -713,42 +702,32 @@ def save_lvs(
         )
 
     # --------------------------------------------------
-    # Finalize
+    # Write out session pickle
     # --------------------------------------------------
-
-    root = zarr.open_group(dest_session.store, zarr_format=3)
-    root.attrs.clear()
-    root.attrs.update(saved_root_attrs)
-
     if write_session_location is None:
-        commit_id = dest_session.commit(f"Added {init_times64.min()} to {init_times64.max()}")
-        print(f"[SAVE_LVS] Committed: {commit_id}")
+        commit_id = dst_session.commit(f"Added {init_times.min()} to {init_times.max()}")
+        print(f"[lv_worker] Committed session: {commit_id}")
+
     else:
         outpath = os.path.join(
             write_session_location,
-            f"lv_{str(init_times64.min()).replace(':', '').replace('-', '').split('.')[0]}_"
-            f"{str(init_times64.max()).replace(':', '').replace('-', '').split('.')[0]}.pickle",
+            f"lv_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}_.pickle",
         )
-
         fs = fsspec.filesystem("s3", profile=aws_profile)
-        with fs.open(outpath, "wb") as f:
-            pickle.dump(dest_session, f)
-        print(f"[SAVE_LVS] Wrote session pickle: {outpath}")
+        print(f"Writing {outpath}")
+        with fs.open(outpath, "wb") as fobj:
+            pickle.dump(dst_session, fobj)
+        print(f"[lv_worker] wrote session {outpath}")
 
 
 @cli.command("submit-jobs")
 @click.argument("start_time", type=click.DateTime())
 @click.argument("end_time", type=click.DateTime())
-@click.option("--src-repo", default=SOURCE_REPO, show_default=True)
-@click.option("--src-branch", default=SOURCE_BRANCH, show_default=True)
-@click.option("--dest-repo", default=DESTINATION_REPO, show_default=True)
-@click.option("--dest-branch", default=DESTINATION_BRANCH, show_default=True)
+@click.option("--src-repo", required=True)
+@click.option("--src-branch", required=True)
+@click.option("--dst-repo", required=True)
+@click.option("--dst-branch", required=True)
 @click.option("--aws-profile", type=str, default="kafou", show_default=True)
-@click.option("--rollout-steps", type=int, default=10, show_default=True)
-@click.option("--lat-min", type=float, default=None)
-@click.option("--lat-max", type=float, default=None)
-@click.option("--lon-min", type=float, default=None)
-@click.option("--lon-max", type=float, default=None)
 @click.option("--init-hour", type=int, default=None)
 @click.option(
     "--coordination-location",
@@ -757,189 +736,136 @@ def save_lvs(
     show_default=True,
 )
 @click.option(
-    "--timesteps-per-job",
+    "--times-at-once",
     type=int,
     default=8,
     show_default=True,
-    help="Number of 6h init_times per SLURM job",
 )
 def submit_jobs(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
     src_repo: str,
     src_branch: str,
-    dest_repo: str,
-    dest_branch: str,
+    dst_repo: str,
+    dst_branch: str,
+    init_hour: int | None,
     aws_profile: str,
     coordination_location: str,
-    timesteps_per_job: int,
-    rollout_steps: int,
-    lat_min: float | None,
-    lat_max: float | None,
-    lon_min: float | None,
-    lon_max: float | None,
-    init_hour: int | None,
+    times_at_once: int,
 ):
     """
     Distributed latent-forecast generation via SLURM.
 
     Contract:
       - `init` MUST already have been run
-      - Each job runs `save-lvs` on a disjoint init_time span
+      - Each job runs `lv-worker` on a disjoint init_time span
       - All jobs write into the same Icechunk session
       - Final merge + commit is atomic
     """
 
-    # ------------------------------------------------------------
     # Validate times
-    # ------------------------------------------------------------
-    for t, name in [(start_time, "start_time"), (end_time, "end_time")]:
-        if t.hour not in (0, 6, 12, 18) or t.minute or t.second or t.microsecond:
-            raise click.ClickException(f"{name} must be 6-hour aligned")
+    client = arraylake.Client()
+    repo = client.get_repo(dst_repo)
+    base_session = repo.writable_session(dst_branch)
+    ds = xr.open_zarr(base_session.store, zarr_format=3, consolidated=False, chunks=None)
 
-    if start_time > end_time:
-        raise click.ClickException("start_time must be <= end_time")
+    print("Click start_time:", start_time, type(start_time))
 
-    # ------------------------------------------------------------
-    # Build init_time chunks
-    # ------------------------------------------------------------
-    init_times: list[datetime.datetime] = []
-    t = start_time
-    while t <= end_time:
-        init_times.append(t)
-        t += datetime.timedelta(hours=6)
+    # Clamp requested time range to available source data
+    start_time, end_time = get_clamped_time_range(ds=ds, start_time=start_time, end_time=end_time)
 
-    chunks = [
-        init_times[i : i + timesteps_per_job] for i in range(0, len(init_times), timesteps_per_job)
-    ]
+    # Extend time axis for new data
+    print(f"[SUBMIT] Ensuring time axis through {end_time}")
+    msg = ensure_time_in_arrays(
+        store=base_session.store, timestamp=end_time, time_dim="init_time", time_frequency="6h"
+    )
+    if init_hour is not None:
+        ds.sel(time=ds.time.dt.hour == init_hour)
+    if msg is not None:
+        commit_with_retries(session=base_session, msg=str(msg))
 
-    time_spans: list[tuple[datetime.datetime, datetime.datetime]] = [
-        (chunk[0], chunk[-1]) for chunk in chunks
-    ]
+    # reopen extended repo
+    client = arraylake.Client()
+    repo = client.get_repo(dst_repo)
+    base_session = repo.writable_session(dst_branch)
 
-    # ------------------------------------------------------------
-    # Create shared Icechunk session
-    # ------------------------------------------------------------
-    lv_job_id = random_job_string()
+    # Build batches
+    batches = list(get_batches(start_time=start_time, end_time=end_time, n=times_at_once))
+
+    lv_job_id = random_job_string(10)
     session_location = os.path.join(coordination_location, lv_job_id)
     session_pickle = os.path.join(session_location, "session.pickle")
 
-    client = arraylake.Client()
-    repo = client.get_repo(dest_repo)
-    base_session = repo.writable_session(dest_branch)
-
-    fs = fsspec.filesystem("s3", profile=aws_profile)
-    fs.makedirs(session_location, exist_ok=True)
-
     print(f"[SUBMIT] Saving base session → {session_pickle}")
-    with fs.open(session_pickle, "wb") as f:
+    fs = fsspec.filesystem("s3", profile=aws_profile)
+    with fs.open(session_pickle, "wb") as fobj:
         with base_session.allow_pickling():
-            pickle.dump(base_session, f)
+            pickle.dump(base_session, fobj)
 
-    # ------------------------------------------------------------
     # Submit SLURM jobs
-    # ------------------------------------------------------------
-    job_prefix = f"lv-{lv_job_id}"
-    expected_spans: set[tuple[str, str]] = set()
+    print(f"[SUBMIT] Submitting {len(batches)} SLURM jobs ({times_at_once} timesteps per job)")
+    job_prefix = f"lv_{lv_job_id}"
+    expected = set()
 
-    for start, end in time_spans:
-        start_str = start.strftime("%Y-%m-%dT%H:%M:%S")
-        end_str = end.strftime("%Y-%m-%dT%H:%M:%S")
-
-        expected_spans.add(
-            (
-                start.strftime("%Y%m%dT%H%M%S"),
-                end.strftime("%Y%m%dT%H%M%S"),
-            )
-        )
+    for batch in batches:
+        start, end = batch[0], batch[-1]  # datetime.datetime, datetime.datetime
+        start_s, end_s = start.isoformat(), end.isoformat()  # str, str
+        expected.add((start_s, end_s))
 
         cmd = [
             "sbatch",
             "--ntasks=1",
             "--cpus-per-task=32",
             "--gpus=1",
-            f"--job-name={job_prefix}_{start_str}_{end_str}",
+            f"--job-name={job_prefix}_{start_s}_{end_s}",
             sys.argv[0],
-            "save-lvs",
-            start_str,
-            end_str,
+            "lv-worker",
+            start_s,
+            end_s,
             f"--src-repo={src_repo}",
             f"--src-branch={src_branch}",
-            f"--dest-repo={dest_repo}",
-            f"--dest-branch={dest_branch}",
-            f"--rollout-steps={rollout_steps}",
+            f"--dst-repo={dst_repo}",
+            f"--dst-branch={dst_branch}",
             f"--aws-profile={aws_profile}",
             f"--write-session-location={session_location}",
         ]
-
-        # ---- spatial bounds (must be complete pairs) ----
-        if any(v is not None for v in (lat_min, lat_max, lon_min, lon_max)):
-            if None in (lat_min, lat_max, lon_min, lon_max):
-                raise RuntimeError("lat/lon bounds must be complete pairs")
-
-            cmd.append(f"--lat-min={lat_min}")
-            cmd.append(f"--lat-max={lat_max}")
-            cmd.append(f"--lon-min={lon_min}")
-            cmd.append(f"--lon-max={lon_max}")
-
-        # ---- optional init hour ----
-        if init_hour is not None:
-            cmd.append(f"--init-hour={init_hour}")
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"sbatch failed:\n{res.stderr}")
 
-    # ------------------------------------------------------------
-    # Wait for jobs to finish
-    # ------------------------------------------------------------
-    print("[SUBMIT] Waiting for SLURM jobs to finish...")
-    time.sleep(10)
+    time.sleep(60)
 
-    while True:
-        remaining = get_job_count(job_prefix)
-        if remaining == 0:
-            break
-        print(f"[SUBMIT] {remaining} jobs remaining...")
+    # Wait for jobs to finish
+    print("[SUBMIT] Waiting for workers...")
+    job_count = get_job_count(job_prefix)
+    while job_count != 0:
+        job_count = get_job_count(job_prefix)
+        print(f"[SUBMIT] {job_count} jobs remaining ...")
         time.sleep(60)
 
-    # ------------------------------------------------------------
-    # Merge completed sessions
-    # ------------------------------------------------------------
-    print("[SUBMIT] All jobs complete. Merging sessions...")
+    # Merge sessions
+    print("[SUBMIT] All Jobs complete. Merging worker sessions...")
+    time.sleep(10)
 
+    print("All jobs completed, gathering results...")
     sessions = []
-    for path in fs.ls(session_location):
-        fname = os.path.basename(path)
-        if fname.startswith("lv_") and fname.endswith(".pickle"):
-            _, s, e = fname.replace(".pickle", "").split("_")
-            expected_spans.discard((s, e))
-            with fs.open(path, "rb") as f:
-                sessions.append(pickle.load(f))
-            fs.rm(path)
+    for fspath in fs.ls(session_location):
+        filename = fspath.split("/")[-1]
+        if filename.startswith("lv_") and filename.endswith(".pickle"):
+            with fs.open(fspath, "rb") as fobj:
+                sessions.append(pickle.load(fobj))
+        fs.rm(fspath)
+    merged_session = merge_sessions(base_session, *sessions)
 
-    merged = merge_sessions(base_session, *sessions)
+    # Add Metadata
+    valid_start = ds.init_time.values.min()
+    set_metadata(session=merged_session, start_time=valid_start, end_time=end_time)
 
-    # ------------------------------------------------------------
     # Commit
-    # ------------------------------------------------------------
-    # if expected_spans:
-    #     commit_msg = (
-    #         f"PARTIAL save-lvs {start_time.isoformat()}..{end_time.isoformat()} "
-    #         f"(missing {len(expected_spans)} spans)"
-    #     )
-    # else:
-    #     commit_msg = f"save-lvs {start_time.isoformat()}..{end_time.isoformat()}"
-
-    commit_msg = f"save-lvs {start_time.isoformat()}..{end_time.isoformat()}"
-
-    commit_id = merged.commit(commit_msg)
+    msg = f"latent-vectorized {start_time.isoformat()} → {end_time.isoformat()}"
+    commit_id = commit_with_retries(session=merged_session, msg=msg)
     print(f"[SUBMIT] Commit complete: {commit_id}")
-
-    # if expected_spans:
-    #     print("[SUBMIT] Missing spans:")
-    #     for s, e in sorted(expected_spans):
-    #         print(f"  {s} → {e}")
 
 
 if __name__ == "__main__":
