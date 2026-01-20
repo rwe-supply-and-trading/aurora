@@ -446,12 +446,13 @@ class InverseRolloutSolver:
             optimizer.zero_grad()
 
             # Create perturbed initial state
+            # Move reference values to the model device before adding perturbations
             perturbed_surf_vars = {
-                k: v + perturbation["surf_vars"].get(k, 0)
+                k: v.to(p.device, p.dtype) + perturbation["surf_vars"].get(k, 0)
                 for k, v in self.reference_batch.surf_vars.items()
             }
             perturbed_atmos_vars = {
-                k: v + perturbation["atmos_vars"].get(k, 0)
+                k: v.to(p.device, p.dtype) + perturbation["atmos_vars"].get(k, 0)
                 for k, v in self.reference_batch.atmos_vars.items()
             }
 
@@ -510,11 +511,11 @@ class InverseRolloutSolver:
         # Compute final achieved trajectory delta
         with torch.no_grad():
             perturbed_surf_vars = {
-                k: v + perturbation["surf_vars"].get(k, 0)
+                k: v.to(p.device, p.dtype) + perturbation["surf_vars"].get(k, 0)
                 for k, v in self.reference_batch.surf_vars.items()
             }
             perturbed_atmos_vars = {
-                k: v + perturbation["atmos_vars"].get(k, 0)
+                k: v.to(p.device, p.dtype) + perturbation["atmos_vars"].get(k, 0)
                 for k, v in self.reference_batch.atmos_vars.items()
             }
             perturbed_batch = dataclasses.replace(
