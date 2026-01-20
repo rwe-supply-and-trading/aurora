@@ -102,14 +102,15 @@ def differentiable_rollout(
             extracted.append(extract_fn(pred, step))
 
         # Create next input batch (keeping computation graph intact)
+        # Handle multi-GPU case: move previous batch tensors to prediction's device
         batch = dataclasses.replace(
             pred,
             surf_vars={
-                k: torch.cat([batch.surf_vars[k][:, 1:], v], dim=1)
+                k: torch.cat([batch.surf_vars[k][:, 1:].to(v.device), v], dim=1)
                 for k, v in pred.surf_vars.items()
             },
             atmos_vars={
-                k: torch.cat([batch.atmos_vars[k][:, 1:], v], dim=1)
+                k: torch.cat([batch.atmos_vars[k][:, 1:].to(v.device), v], dim=1)
                 for k, v in pred.atmos_vars.items()
             },
         )
