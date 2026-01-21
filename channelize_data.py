@@ -1,6 +1,7 @@
 import datetime
 import os
 import pickle
+import random
 import subprocess
 import sys
 import time
@@ -58,25 +59,12 @@ def get_clamped_time_range(
     Clamp (start_time, end_time) to the available time range in ds.
     Raises if start_time is entirely outside the dataset.
     """
-    time_coord = ds[next(c for c in ds.coords if np.issubdtype(ds[c].dtype, np.datetime64))]
+    return start_time, end_time
 
-    src_end = time_coord.values[-1].astype("datetime64[ns]").astype(datetime.datetime)
 
-    if start_time > src_end:
-        raise RuntimeError(
-            f"start_time={start_time.isoformat()} is after last available "
-            f"source timestamp={src_end.isoformat()}"
-        )
-
-    clamped_end = min(end_time, src_end)
-
-    if clamped_end < end_time:
-        print(
-            f"[SUBMIT] Clamping end_time → {clamped_end.isoformat()} "
-            f"(source max={src_end.isoformat()})"
-        )
-
-    return start_time, clamped_end
+def random_job_string(length: int = 8) -> str:
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(random.choice(chars) for _ in range(length))
 
 
 def open_src_datasets(
@@ -309,86 +297,6 @@ def get_batches(ds: xr.Dataset, start: datetime.datetime, end: datetime.datetime
         cur = nxt + step
 
 
-def channelize_batch(
-    *,
-    store: zarr.abc.store.Store,
-    timestamps: list[datetime.datetime],
-    sfc_ds: xr.Dataset,
-    pl_ds: xr.Dataset,
-) -> xr.Dataset:
-    """
-    Process one batch and region-write its data
-    into an existing Zarr samples store.
-
-    - Loads surface and pressure-level data from store
-    - Builds a dense (time, channel, lat, lon) block
-    - Writes ONLY `samples/sample_data` using coordinate-based region writes
-    - Pressure-level variables are flattened across levels into channels
-    - Existing timestamps are intentionally overwritten.
-    """
-    print(f"\n=== PROCESSING {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d} ===")
-
-    sfc_vars, pl_vars = list(NAME_MAP["sfc"]), list(NAME_MAP["pl"])
-
-    # Read batch with retries catch Icechunk streaming, S3 stalls, network issues, etc.
-    for attempt in range(1, READ_RETRIES + 1):
-        try:
-            sfc = sfc_ds[sfc_vars].sel(time=timestamps).load()
-            pl = pl_ds[pl_vars].sel(time=timestamps).load()
-            break
-        except (OSError, RuntimeError, icechunk.IcechunkError) as e:
-            print(f"   → exception type: {type(e).__name__}")
-            if attempt == READ_RETRIES:
-                print(
-                    f"Read failed for {timestamps[0]:%Y-%m-%d} → {timestamps[-1]:%Y-%m-%d} "
-                    f"after {READ_RETRIES} attempts — aborting batch."
-                )
-                raise
-
-    if not np.array_equal(sfc.time.values, pl.time.values):
-        raise RuntimeError("sfc/pl time mismatch")
-
-    n_levels = pl.level.size
-    in_locs, _ = get_variable_locations(n_levels)
-
-    T, Y, X = sfc.time.size, sfc.latitude.size, sfc.longitude.size
-    n_channels = len(NAME_MAP["sfc"]) + len(NAME_MAP["pl"]) * n_levels
-
-    block = np.empty((T, n_channels, Y, X), dtype=np.float32)
-
-    for v, (cidx, _) in in_locs["sfc"].items():
-        block[:, cidx, :, :] = sfc[v].values
-
-    for v, (cidx, size) in in_locs["pl"].items():
-        block[:, cidx : cidx + size, :, :] = pl[v].values
-
-    write_ds = xr.Dataset(
-        {
-            "sample_data": (
-                ("time", "channel", "latitude", "longitude"),
-                block,
-            )
-        },
-        coords={
-            "time": sfc.time.values,
-            "latitude": sfc.latitude.values,
-            "longitude": sfc.longitude.values,
-        },
-    )
-
-    # Region writes
-    write_ds.to_zarr(
-        store,
-        group="samples",
-        region="auto",  # region="auto" → xarray resolves correct indices from time coords
-        mode="a",  # mode="a" → append / overwrite existing regions
-        consolidated=False,
-    )
-
-    print(f"   ✔ Finished writing batch {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d}.")
-    return write_ds
-
-
 def get_or_create_repo_branch(
     *,
     client: arraylake.Client,
@@ -451,7 +359,7 @@ def set_metadata(
     end_time: datetime.datetime | None = None,
     extra: dict | None = None,
 ) -> None:
-    root = zarr.open_group(session.store, group="samples", zarr_format=3)
+    root = zarr.open_group(session.store, path="samples", zarr_format=3)
 
     attrs = dict(root.attrs)
 
@@ -496,8 +404,6 @@ def cli():
 @click.option("--dst-repo", required=True)
 @click.option("--dst-branch", default="main")
 @click.option("--write-session-location", required=True)
-@click.option("--aws-profile", type=str, default="kafou", show_default=True)
-@click.option("--times-at-once", type=int, default=14)
 @click.option("--token", default=None)
 def channelize_worker(
     start_time: datetime.datetime,
@@ -507,47 +413,123 @@ def channelize_worker(
     dst_repo: str,
     dst_branch: str,
     write_session_location: str,
-    times_at_once: int,
-    aws_profile: str,
     token: str | None,
 ) -> None:
+    print(f"\n=== PROCESSING {start_time:%Y-%m-%d}-{end_time:%Y-%m-%d} ===")
+    # --------------------------------------------------
+    # Session handling
+    # --------------------------------------------------
     client = arraylake.Client(token=token)
     if token is None and src_repo.startswith("rwe/"):
         client.login()
-
     if write_session_location is not None:
-        fs = fsspec.filesystem("s3", profile=aws_profile)
-        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as f:
-            dst_session = pickle.load(f)
+        fs = fsspec.filesystem("s3")
+        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as fobj:
+            dst_session = pickle.load(fobj)
     else:
         repo = client.get_repo(dst_repo)
         dst_session = repo.writable_session(dst_branch)
 
+    # --------------------------------------------------
+    # Get Destination Session Store
+    # --------------------------------------------------
+    ds_store = xr.open_zarr(
+        dst_session.store,
+        zarr_format=3,
+        consolidated=False,
+        group="samples",
+        chunks=None,
+    )
+
+    # Get timestamps
+    timestamps = (
+        ds_store["time"].sel(time=slice(start_time, end_time)).values.astype("datetime64[ns]")
+    )
+
+    # --------------------------------------------------
+    # The meat
+    # --------------------------------------------------
     sfc_ds, pl_ds, _ = open_src_datasets(
         src_repo=src_repo,
         src_branch=src_branch,
         token=token,
     )
+    sfc_vars, pl_vars = list(NAME_MAP["sfc"]), list(NAME_MAP["pl"])
 
-    batches = get_batches(sfc_ds, start_time, end_time, times_at_once)
+    # Read batch with retries catch Icechunk streaming, S3 stalls, network issues, etc.
+    for attempt in range(1, READ_RETRIES + 1):
+        try:
+            sfc = sfc_ds[sfc_vars].sel(time=timestamps).load()
+            pl = pl_ds[pl_vars].sel(time=timestamps).load()
+            break
+        except (OSError, RuntimeError, icechunk.IcechunkError) as e:
+            print(f"   → exception type: {type(e).__name__}")
+            if attempt == READ_RETRIES:
+                print(
+                    f"Read failed for {timestamps[0]:%Y-%m-%d} → {timestamps[-1]:%Y-%m-%d} "
+                    f"after {READ_RETRIES} attempts — aborting batch."
+                )
+                raise
 
-    for batch in batches:
-        channelize_batch(
-            store=dst_session.store,
-            timestamps=batch,
-            sfc_ds=sfc_ds,
-            pl_ds=pl_ds,
-        )
+    if not np.array_equal(sfc.time.values, pl.time.values):
+        raise RuntimeError("sfc/pl time mismatch")
 
-    out = (
-        f"{write_session_location}/chan_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}.pickle"
+    n_levels = pl.level.size
+    in_locs, _ = get_variable_locations(n_levels)
+
+    T, Y, X = sfc.time.size, sfc.latitude.size, sfc.longitude.size
+    n_channels = len(NAME_MAP["sfc"]) + len(NAME_MAP["pl"]) * n_levels
+
+    block = np.empty((T, n_channels, Y, X), dtype=np.float32)
+
+    for v, (cidx, _) in in_locs["sfc"].items():
+        block[:, cidx, :, :] = sfc[v].values
+
+    for v, (cidx, size) in in_locs["pl"].items():
+        block[:, cidx : cidx + size, :, :] = pl[v].values
+
+    write_ds = xr.Dataset(
+        {
+            "sample_data": (
+                ("time", "channel", "latitude", "longitude"),
+                block,
+            )
+        },
+        coords={
+            "time": sfc.time.values,
+            "latitude": sfc.latitude.values,
+            "longitude": sfc.longitude.values,
+        },
     )
 
-    with fs.open(out, "wb") as f:
-        with dst_session.allow_pickling():
-            pickle.dump(dst_session, f)
+    # Region writes
+    write_ds.to_zarr(
+        dst_session.store,
+        path="samples",
+        region="auto",  # region="auto" → xarray resolves correct indices from time coords
+        mode="a",  # mode="a" → append / overwrite existing regions
+        consolidated=False,
+    )
 
-    print(f"[WORKER] wrote session {out}")
+    print(f"   ✔ Finished writing batch {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d}.")
+
+    # --------------------------------------------------
+    # Write out session pickle
+    # --------------------------------------------------
+    if write_session_location is None:
+        # commit_id = dst_session.commit(f"Added {init_times.min()} to {init_times.max()}")
+        # print(f"[channelize_worker] Committed session: {commit_id}")
+        pass
+    else:
+        outpath = os.path.join(
+            write_session_location,
+            f"chan_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}_.pickle",
+        )
+        fs = fsspec.filesystem("s3")
+        print(f"Writing {outpath}")
+        with fs.open(outpath, "wb") as fobj:
+            pickle.dump(dst_session, fobj)
+        print(f"[channelize_worker] wrote session {outpath}")
 
 
 @cli.command("submit-jobs")
@@ -605,33 +587,36 @@ def submit_jobs(
     print(f"[SUBMIT] Ensuring time axis through {end_time}")
 
     base_session = repo.writable_session(dst_branch)
-    ensure_time_in_arrays(
+    msg = ensure_time_in_arrays(
         store=base_session.store,
         timestamp=end_time,
         time_frequency="6h",
         group="samples",
     )
+    if msg is not None:
+        commit_with_retries(session=base_session, msg=str(msg))
+
+    # reopen extended repo
+    client = arraylake.Client()
+    repo = client.get_repo(dst_repo)
+    base_session = repo.writable_session(dst_branch)
 
     batches = list(get_batches(sfc_ds, start_time, end_time, times_at_once))
-    if not batches:
-        raise RuntimeError("No batches to process")
 
     # Create base Icechunk session
-    run_id = f"{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}"
-    session_dir = f"{coordination_location}/channelize-{run_id}"
-    session_pickle = f"{session_dir}/session.pickle"
+    job_id = random_job_string(10)
+    session_location = os.path.join(coordination_location, job_id)
+    session_pickle = os.path.join(session_location, "session.pickle")
 
     print(f"[SUBMIT] Saving base session → {session_pickle}")
     fs = fsspec.filesystem("s3")
-    fs.makedirs(session_dir, exist_ok=True)
-    with fs.open(session_pickle, "wb") as f:
+    with fs.open(session_pickle, "wb") as fobj:
         with base_session.allow_pickling():
-            pickle.dump(base_session, f)
+            pickle.dump(base_session, fobj)
 
-    # Submit SLURM jobs
-    job_prefix = f"chan-{run_id}"
-    expected = set()
     print(f"[SUBMIT] Submitting {len(batches)} SLURM jobs ({times_at_once} timesteps per job)")
+    job_prefix = f"chan_{job_id}"
+    expected = set()
 
     for batch in batches:
         start, end = batch[0], batch[-1]  # datetime.datetime, datetime.datetime
@@ -652,7 +637,7 @@ def submit_jobs(
             f"--dst-repo={dst_repo}",
             f"--dst-branch={dst_branch}",
             f"--times-at-once={times_at_once}",
-            f"--write-session-location={session_dir}",
+            f"--write-session-location={session_location}",
         ]
 
         if token is not None:
@@ -662,33 +647,32 @@ def submit_jobs(
         if res.returncode != 0:
             raise RuntimeError(f"sbatch failed:\n{res.stderr}")
 
+    time.sleep(60)
+
     # Wait for jobs to finish
     print("[SUBMIT] Waiting for workers...")
-    while True:
-        remaining = get_job_count(job_prefix)
-        if remaining == 0:
-            break
-        print(f"[SUBMIT] {remaining} jobs remaining...")
+    job_count = get_job_count(job_prefix)
+    while job_count != 0:
+        job_count = get_job_count(job_prefix)
+        print(f"[SUBMIT] {job_count} jobs remaining ...")
         time.sleep(60)
 
     # Merge sessions
-    print("[SUBMIT] Merging worker sessions...")
+    print("[SUBMIT] All Jobs complete. Merging worker sessions...")
+    time.sleep(10)
+
+    print("All jobs completed, gathering results...")
     sessions = []
-    for path in fs.ls(session_dir):
-        name = path.rstrip("/").split("/")[-1]
-
-        if name == "session.pickle":
-            continue
-        if not name.endswith(".pickle"):
-            continue
-
-        with fs.open(path, "rb") as f:
-            sessions.append(pickle.load(f))
-        fs.rm(path)
+    for fspath in fs.ls(session_location):
+        filename = fspath.split("/")[-1]
+        if filename.startswith("chan_") and filename.endswith(".pickle"):
+            with fs.open(fspath, "rb") as fobj:
+                sessions.append(pickle.load(fobj))
+        fs.rm(fspath)
     merged_session = merge_sessions(base_session, *sessions)
 
     # Add Metadata
-    set_metadata(session=merged_session, start_time=start_time, end_time=end_time)
+    set_metadata(session=merged_session, start_time=sfc_ds.time.values.min(), end_time=end_time)
 
     # Commit
     msg = f"channelize {start_time.isoformat()} → {end_time.isoformat()}"
@@ -697,8 +681,6 @@ def submit_jobs(
 
 
 @cli.command("init")
-@click.argument("start_time", type=click.DateTime())
-@click.argument("end_time", type=click.DateTime())
 @click.option("--src-repo", default="rwe/era5-0p25-6h-nonprod-ohio")
 @click.option("--dst-repo", default="kafou/aurora-era5-samples")
 @click.option("--src-branch", default="main")

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # -----------------------------
 # USAGE:
-#   ./run_channelize_range.sh \
+#   ./run_channelize_today.sh \
 #     2025-01-01T00:00:00 \
 #     2025-12-31T18:00:00 \ 
 #     rwe/era5-0p25-6h-nonprod-ohio \
