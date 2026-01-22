@@ -30,7 +30,7 @@ fi
 # Config
 # -----------------------------
 COORDINATION_LOCATION="s3://icechunk-write-coordination"
-TIMES_AT_ONCE=14
+TIMES_AT_ONCE=8
 CPUS=16
 
 SCRIPT="channelize_data.py"

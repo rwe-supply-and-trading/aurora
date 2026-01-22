@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import datetime
 import os
 import pickle
@@ -81,7 +83,6 @@ def open_src_datasets(
         client.login()
 
     # detect what dataset we're working with
-    print(src_repo)
     if "era5" in src_repo:
         dataset_type = "era5"
     elif "ecmwf" in src_repo:
@@ -193,6 +194,8 @@ def init_store(
     sfc_ds: xr.Dataset,
     pl_ds: xr.Dataset,
     inv_ds: xr.Dataset,
+    start_time: datetime.datetime | None = None,
+    end_time: datetime.datetime | None = None,
 ) -> None:
     """
     Initialize the destination Zarr layout.
@@ -218,6 +221,12 @@ def init_store(
 
     # Schema derivation
     time_coord, lat_coord, lon_coord = sfc_ds.time, sfc_ds.latitude, sfc_ds.longitude
+    time_coord = time_coord.sel(
+        time=slice(
+            np.datetime64(start_time) if start_time is not None else time_coord.min().values,
+            np.datetime64(end_time) if end_time is not None else time_coord.max().values,
+        )
+    )
 
     n_levels = int(pl_ds.level.size)
     levels = pl_ds.level.values.astype("int32")
@@ -303,7 +312,7 @@ def get_or_create_repo_branch(
     repo_name: str,
     branch_name: str,
     base_branch: str = "main",
-) -> tuple[arraylake.Repo, arraylake.WritableSession]:
+):
     """
     Open an Arraylake repo and branch, creating them if they do not exist.
     """
@@ -420,10 +429,12 @@ def channelize_worker(
     # Session handling
     # --------------------------------------------------
     client = arraylake.Client(token=token)
+
     if token is None and src_repo.startswith("rwe/"):
         client.login()
+
     if write_session_location is not None:
-        fs = fsspec.filesystem("s3")
+        fs = fsspec.filesystem("s3", profile="kafou")
         with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as fobj:
             dst_session = pickle.load(fobj)
     else:
@@ -445,9 +456,10 @@ def channelize_worker(
     timestamps = (
         ds_store["time"].sel(time=slice(start_time, end_time)).values.astype("datetime64[ns]")
     )
+    print(timestamps)
 
     # --------------------------------------------------
-    # The meat
+    # The meat of it all
     # --------------------------------------------------
     sfc_ds, pl_ds, _ = open_src_datasets(
         src_repo=src_repo,
@@ -456,17 +468,22 @@ def channelize_worker(
     )
     sfc_vars, pl_vars = list(NAME_MAP["sfc"]), list(NAME_MAP["pl"])
 
+    # TODO: avoiding Icechunk Bytes Streaming Error
     # Read batch with retries catch Icechunk streaming, S3 stalls, network issues, etc.
     for attempt in range(1, READ_RETRIES + 1):
         try:
+            print("    → loading sfc")
             sfc = sfc_ds[sfc_vars].sel(time=timestamps).load()
+            print("    → loading pl")
             pl = pl_ds[pl_vars].sel(time=timestamps).load()
+            print("    → constructing block")
             break
         except (OSError, RuntimeError, icechunk.IcechunkError) as e:
             print(f"   → exception type: {type(e).__name__}")
+            print(f"   → exception: {e}")
             if attempt == READ_RETRIES:
                 print(
-                    f"Read failed for {timestamps[0]:%Y-%m-%d} → {timestamps[-1]:%Y-%m-%d} "
+                    f"Read failed for {start_time:%Y%m%dT%H%M%S} -> {end_time:%Y%m%dT%H%M%S} "
                     f"after {READ_RETRIES} attempts — aborting batch."
                 )
                 raise
@@ -503,29 +520,31 @@ def channelize_worker(
     )
 
     # Region writes
+    print("→ writing to zarr")
     write_ds.to_zarr(
         dst_session.store,
-        path="samples",
+        group="samples",
         region="auto",  # region="auto" → xarray resolves correct indices from time coords
         mode="a",  # mode="a" → append / overwrite existing regions
         consolidated=False,
     )
+    print("→ write complete")
 
-    print(f"   ✔ Finished writing batch {timestamps[0]:%Y-%m-%d}-{timestamps[-1]:%Y-%m-%d}.")
+    print(f"   ✔ Finished writing batch {start_time:%Y%m%dT%H%M%S}-{end_time:%Y%m%dT%H%M%S}.")
 
     # --------------------------------------------------
     # Write out session pickle
     # --------------------------------------------------
     if write_session_location is None:
-        # commit_id = dst_session.commit(f"Added {init_times.min()} to {init_times.max()}")
-        # print(f"[channelize_worker] Committed session: {commit_id}")
+        commit_id = dst_session.commit(f"Added {timestamps.min()} to {timestamps.max()}")
+        print(f"[channelize_worker] Committed session: {commit_id}")
         pass
     else:
         outpath = os.path.join(
             write_session_location,
             f"chan_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}_.pickle",
         )
-        fs = fsspec.filesystem("s3")
+        fs = fsspec.filesystem("s3", profile="kafou")
         print(f"Writing {outpath}")
         with fs.open(outpath, "wb") as fobj:
             pickle.dump(dst_session, fobj)
@@ -609,7 +628,7 @@ def submit_jobs(
     session_pickle = os.path.join(session_location, "session.pickle")
 
     print(f"[SUBMIT] Saving base session → {session_pickle}")
-    fs = fsspec.filesystem("s3")
+    fs = fsspec.filesystem("s3", profile="kafou")
     with fs.open(session_pickle, "wb") as fobj:
         with base_session.allow_pickling():
             pickle.dump(base_session, fobj)
@@ -636,7 +655,6 @@ def submit_jobs(
             f"--src-branch={src_branch}",
             f"--dst-repo={dst_repo}",
             f"--dst-branch={dst_branch}",
-            f"--times-at-once={times_at_once}",
             f"--write-session-location={session_location}",
         ]
 
@@ -672,7 +690,8 @@ def submit_jobs(
     merged_session = merge_sessions(base_session, *sessions)
 
     # Add Metadata
-    set_metadata(session=merged_session, start_time=sfc_ds.time.values.min(), end_time=end_time)
+    init_time = sfc_ds.time.values.min().item().astype("datetime64[us]").astype(object)
+    set_metadata(session=merged_session, start_time=init_time, end_time=end_time)
 
     # Commit
     msg = f"channelize {start_time.isoformat()} → {end_time.isoformat()}"
@@ -681,6 +700,8 @@ def submit_jobs(
 
 
 @cli.command("init")
+@click.option("--start-time", type=click.DateTime(), default=None)
+@click.option("--end-time", type=click.DateTime(), default=None)
 @click.option("--src-repo", default="rwe/era5-0p25-6h-nonprod-ohio")
 @click.option("--dst-repo", default="kafou/aurora-era5-samples")
 @click.option("--src-branch", default="main")
@@ -692,6 +713,8 @@ def submit_jobs(
     help="DANGER: delete and recreate the destination schema if it already exists",
 )
 def init(
+    start_time: datetime.datetime | None,
+    end_time: datetime.datetime | None,
     src_repo: str,
     src_branch: str,
     dst_repo: str,
@@ -747,6 +770,8 @@ def init(
         sfc_ds=sfc_ds,
         pl_ds=pl_ds,
         inv_ds=inv_ds,
+        start_time=start_time,
+        end_time=end_time,
     )
 
     # Add Metadata
@@ -755,6 +780,16 @@ def init(
     # Commit
     commit_id = commit_with_retries(session=session, msg="Initialized sample data store.")
     print(f"✓ Initialized; commit_id={commit_id}")
+
+    ds = xr.open_zarr(
+        session.store,
+        zarr_format=3,
+        consolidated=False,
+        group="samples",
+        chunks=None,
+    )
+
+    print(ds)
 
 
 if __name__ == "__main__":
