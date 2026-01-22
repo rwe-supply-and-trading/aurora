@@ -690,8 +690,7 @@ def submit_jobs(
     merged_session = merge_sessions(base_session, *sessions)
 
     # Add Metadata
-    init_time = sfc_ds.time.values.min().item().astype("datetime64[us]").astype(object)
-    set_metadata(session=merged_session, start_time=init_time, end_time=end_time)
+    set_metadata(session=merged_session, start_time=start_time, end_time=end_time)
 
     # Commit
     msg = f"channelize {start_time.isoformat()} → {end_time.isoformat()}"
