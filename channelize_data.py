@@ -89,7 +89,13 @@ def open_src_datasets(
     else:
         raise ValueError("Source repo must be ERA5 or ECMWF ecmwf dataset.")
 
-    src_repo = client.get_repo(src_repo, storage_options={"network_stream_timeout_seconds": 0})
+    src_repo = client.get_repo(
+        src_repo,
+        storage_options={
+            "network_stream_timeout_seconds": 0,
+            "minimum_throughput_bytes_per_second": 0,
+        },
+    )
     src_session = src_repo.readonly_session(src_branch)
 
     if dataset_type == "ecmwf":
@@ -152,7 +158,13 @@ def open_src_datasets(
 
     # get invariant ds from ERA5 dataset
     inv_repo = "rwe/era5-0p25-6h-nonprod-ohio"
-    inv_repo = client.get_repo(inv_repo, storage_options={"network_stream_timeout_seconds": 0})
+    inv_repo = client.get_repo(
+        inv_repo,
+        storage_options={
+            "network_stream_timeout_seconds": 0,
+            "minimum_throughput_bytes_per_second": 0,
+        },
+    )
     inv_session = inv_repo.readonly_session("main")
     inv_ds = xr.open_zarr(
         inv_session.store,
@@ -320,7 +332,13 @@ def get_or_create_repo_branch(
     """
     # Repo
     try:
-        repo = client.get_repo(repo_name, storage_options={"network_stream_timeout_seconds": 0})
+        repo = client.get_repo(
+            repo_name,
+            storage_options={
+                "network_stream_timeout_seconds": 0,
+                "minimum_throughput_bytes_per_second": 0,
+            },
+        )
         print(f"✓ Opened existing repo: {repo_name}")
     except Exception:
         repo = client.create_repo(repo_name)
