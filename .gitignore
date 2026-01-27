@@ -40,3 +40,9 @@ mlruns/
 mlruns/
 
 *.zarr/
+*.logs
+
+logs/
+
+test_ka.py
+test_network_script.py
