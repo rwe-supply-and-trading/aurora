@@ -40,3 +40,7 @@ mlruns/
 mlrun/
 
 *.zarr/
+
+logs/
+
+channelize_data.py

@@ -17,7 +17,6 @@ import torch
 import xarray as xr
 import zarr
 from dataset_io import ensure_time_in_arrays
-from icechunk.distributed import merge_sessions
 
 from aurora import AuroraPretrained
 from aurora.data import ERA5DataLoaderFOAM
@@ -26,16 +25,24 @@ from aurora.rollout import rollout_with_latents
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 
-def get_batches(start_time: datetime.datetime, end_time: datetime.datetime, n: int = 1):
+import numpy as np
+
+
+def _to_iso(dt_like):
+    if isinstance(dt_like, np.datetime64):
+        return np.datetime_as_string(dt_like, unit="s")
+    elif isinstance(dt_like, datetime.datetime):
+        return dt_like.isoformat()
+    else:
+        raise TypeError(f"Unsupported datetime type: {type(dt_like)}")
+
+
+def get_batches(times: np.ndarray, n: int):
     """
     Generate batches of timestamps from ds between start_time and end_time, n at a time.
     """
-    step = datetime.timedelta(hours=6)
-    cur = start_time
-    while cur <= end_time:
-        nxt = min(cur + step * (n - 1), end_time)
-        yield [cur + i * step for i in range(int((nxt - cur) / step) + 1)]
-        cur = nxt + step
+    for i in range(0, len(times), n):
+        yield times[i : i + n]
 
 
 def get_clamped_time_range(
@@ -108,30 +115,30 @@ def commit_with_retries(session, msg: str, max_attempts: int = 6):
 def set_metadata(
     *,
     session,
-    start_time: datetime.datetime | None = None,
-    end_time: datetime.datetime | None = None,
+    start_time: datetime.datetime | np.datetime64 | None = None,
+    end_time: datetime.datetime | np.datetime64 | None = None,
     extra: dict | None = None,
 ) -> None:
+    # Canonicalize to ISO STRINGS ONCE
+    start_s = _to_iso(start_time) if start_time is not None else None
+    end_s = _to_iso(end_time) if end_time is not None else None
+
     root = zarr.open_group(session.store, zarr_format=3)
 
     attrs = dict(root.attrs)
 
     old = attrs.get("valid_times")
+
     if old:
         attrs["valid_times"] = [
-            min(old[0], start_time.isoformat()),
-            max(old[1], end_time.isoformat()),
+            min(old[0], start_s) if start_s is not None else old[0],
+            max(old[1], end_s) if end_s is not None else old[1],
         ]
-    elif start_time is None and end_time is None:
-        attrs["valid_times"] = [
-            None,
-            None,
-        ]
+    elif start_s is None and end_s is None:
+        attrs["valid_times"] = [None, None]
     else:
-        attrs["valid_times"] = [
-            start_time.isoformat(),
-            end_time.isoformat(),
-        ]
+        attrs["valid_times"] = [start_s, end_s]
+
     attrs["last_updated"] = datetime.datetime.now().isoformat()
 
     if extra:
@@ -400,7 +407,6 @@ def init_store(
             * feature       (feature) int64
             * init_time     (init_time) datetime64[ns]
             * lead_time     (lead_time) int64
-            valid_time      (init_time, lead_time) datetime64[ns]
             * spatial_location  (spatial_location) int64
         Data variables:
             lv              (init_time, lead_time, spatial_location, feature) float32
@@ -440,7 +446,6 @@ def init_store(
             "lead_time": ("lead_time", lead_times),
             "spatial_location": ("spatial_location", spatial_coord),
             "feature": ("feature", np.arange(n_feature, dtype="int64")),
-            "valid_time": (("init_time", "lead_time"), valid_times),
         },
         attrs={
             "description": "Aurora latent vector forecast dataset.",
@@ -461,7 +466,6 @@ def init_store(
         encoding={
             "init_time": {"chunks": (len(init_times),)},
             "lead_time": {"chunks": (len(lead_times),)},
-            "valid_time": {"chunks": (len(init_times), len(lead_times))},
             "spatial_location": {"chunks": (n_spatial,)},
             "feature": {"chunks": (n_feature,)},
         },
@@ -541,7 +545,6 @@ def init(
     * lead_time         (lead_time) int64
     * spatial_location  (spatial_location) int64
     * feature           (feature) int64
-      valid_time        (init_time, lead_time) datetime64[ns]
 
     Data variables:
         latent_forecast   (init_time, lead_time, spatial_location, feature) float32
@@ -600,7 +603,7 @@ def init(
 @click.option("--src-branch", required=True)
 @click.option("--dst-repo", required=True)
 @click.option("--dst-branch", required=True)
-@click.option("--write-session-location", type=str, default=None)
+@click.option("--fork-pickle", type=str, default=None)
 @click.option("--aws-profile", type=str, default="kafou", show_default=True)
 def lv_worker(
     start_time: datetime.datetime,
@@ -609,21 +612,30 @@ def lv_worker(
     src_branch: str,
     dst_repo: str,
     dst_branch: str,
-    write_session_location: str | None,
+    fork_pickle: str | None,
     aws_profile: str,
 ):
-    print(f"\n=== PROCESSING {start_time:%Y-%m-%d}-{end_time:%Y-%m-%d} ===")
+    print("\n" + "=" * 80)
+    print(f"[BATCH] {start_time:%Y-%m-%d} → {end_time:%Y-%m-%d}")
+    print("=" * 80)
+
     # --------------------------------------------------
     # Session handling
     # --------------------------------------------------
+    print("▶ [SESSION] initializing client + destination session")
     client = arraylake.Client()
-    if write_session_location is not None:
-        fs = fsspec.filesystem("s3", profile=aws_profile)
-        with fs.open(os.path.join(write_session_location, "session.pickle"), "rb") as fobj:
+
+    if fork_pickle is not None:
+        print("    ↳ loading fork session pickle")
+        fs = fsspec.filesystem("s3", profile="kafou")
+        with fs.open(fork_pickle, "rb") as fobj:
             dst_session = pickle.load(fobj)
+        print("    ✔ fork session loaded")
     else:
+        print("    ↳ opening writable destination session")
         repo = client.get_repo(dst_repo)
         dst_session = repo.writable_session(dst_branch)
+        print("    ✔ destination session opened")
 
     # --------------------------------------------------
     # Get Destination Session Store
@@ -641,13 +653,8 @@ def lv_worker(
     # Get Timestamps ?
     # --------------------------------------------------
     lead_times = ds_store["lead_time"].values.astype("int64")
-    init_times = (
-        ds_store["init_time"]
-        .sel(init_time=slice(start_time, end_time))
-        .values.astype("datetime64[ns]")
-    )
+    init_times = ds_store["init_time"].sel(init_time=slice(start_time, end_time)).values
 
-    init_times = init_times.astype("datetime64[ns]")
     rollout_steps = len(lead_times)
     print(f"[lv_worker] init_times to process: {init_times}")
     print(f"[lv_worker] lead_times to process: {np.arange(1, rollout_steps + 1) * 6}")
@@ -704,13 +711,13 @@ def lv_worker(
     # --------------------------------------------------
     # Write out session pickle
     # --------------------------------------------------
-    if write_session_location is None:
+    if fork_pickle is None:
         commit_id = dst_session.commit(f"Added {init_times.min()} to {init_times.max()}")
         print(f"[lv_worker] Committed session: {commit_id}")
 
     else:
         outpath = os.path.join(
-            write_session_location,
+            fork_pickle,
             f"lv_{start_time:%Y%m%dT%H%M%S}_{end_time:%Y%m%dT%H%M%S}_.pickle",
         )
         fs = fsspec.filesystem("s3", profile=aws_profile)
@@ -762,54 +769,97 @@ def submit_jobs(
       - All jobs write into the same Icechunk session
       - Final merge + commit is atomic
     """
+    print("\n" + "=" * 80)
+    print(f"[SUBMIT] {start_time:%Y-%m-%d %H:%M} → {end_time:%Y-%m-%d %H:%M}")
+    print("=" * 80)
 
+    # --------------------------------------------------
+    # Client + repo setup
+    # --------------------------------------------------
     # Validate times
     client = arraylake.Client()
     repo = client.get_repo(dst_repo)
     base_session = repo.writable_session(dst_branch)
     ds = xr.open_zarr(base_session.store, zarr_format=3, consolidated=False, chunks=None)
 
-    print("Click start_time:", start_time, type(start_time))
-
-    # Clamp requested time range to available source data
+    # --------------------------------------------------
+    # Clamp time range
+    # --------------------------------------------------
+    print("▶ [TIME] clamping requested time range to source availability")
+    orig_start, orig_end = start_time, end_time
     start_time, end_time = get_clamped_time_range(ds=ds, start_time=start_time, end_time=end_time)
 
-    # Extend time axis for new data
-    print(f"[SUBMIT] Ensuring time axis through {end_time}")
+    # --------------------------------------------------
+    # Extend time axis
+    # --------------------------------------------------
+    print(f"▶ [DEST] ensuring time axis through {end_time}")
+    base_session = repo.writable_session(dst_branch)
     msg = ensure_time_in_arrays(
-        store=base_session.store, timestamp=end_time, time_dim="init_time", time_frequency="6h"
+        store=base_session.store,
+        timestamp=end_time,
+        time_dim="init_time",
+        time_frequency="6h",
+        init_hour=init_hour,
     )
-    if init_hour is not None:
-        ds.sel(time=ds.time.dt.hour == init_hour)
+
     if msg is not None:
         commit_with_retries(session=base_session, msg=str(msg))
 
-    # reopen extended repo
-    client = arraylake.Client()
-    repo = client.get_repo(dst_repo)
+    # --------------------------------------------------
+    # Fork base session
+    # --------------------------------------------------
+    print("▶ [SESSION] creating base fork for workers")
     base_session = repo.writable_session(dst_branch)
+    fork = base_session.fork()
+    print("  ✔ base session forked")
 
+    # --------------------------------------------------
+    # Batch planning
+    # --------------------------------------------------
     # Build batches
-    batches = list(get_batches(start_time=start_time, end_time=end_time, n=times_at_once))
+    ds = xr.open_zarr(base_session.store, zarr_format=3, consolidated=False, chunks=None)
+    init_times = ds["init_time"].sel(init_time=slice(start_time, end_time)).values
+    batches = list(get_batches(init_times, times_at_once))
+    print("▶ [BATCH] planning batches")
+    print(f"  ↳ total batches: {len(batches)}")
+    print(f"  ↳ timesteps per batch: {times_at_once}")
 
-    lv_job_id = random_job_string(10)
-    session_location = os.path.join(coordination_location, lv_job_id)
-    session_pickle = os.path.join(session_location, "session.pickle")
+    if len(batches) > 0:
+        print(f"  ↳ first batch: {batches[0][0]} → {batches[0][-1]}")
+        print(f"  ↳ last batch:  {batches[-1][0]} → {batches[-1][-1]}")
 
-    print(f"[SUBMIT] Saving base session → {session_pickle}")
-    fs = fsspec.filesystem("s3", profile=aws_profile)
-    with fs.open(session_pickle, "wb") as fobj:
-        with base_session.allow_pickling():
-            pickle.dump(base_session, fobj)
+    # --------------------------------------------------
+    # Save base fork session
+    # --------------------------------------------------
+    job_id = random_job_string(10)
+    session_location = os.path.join(coordination_location, job_id)
+    fork_pickle = os.path.join(session_location, "fork.pickle")
+
+    print("▶ [SESSION] saving base fork session")
+    print(f"  ↳ job_id: {job_id}")
+    print(f"  ↳ coordination dir: {session_location}")
+    print(f"  ↳ fork pickle: {fork_pickle}")
+
+    fs = fsspec.filesystem("s3", profile="kafou")
+    with fs.open(fork_pickle, "wb") as fobj:
+        pickle.dump(fork, fobj)
+
+    print("  ✔ base fork pickle saved")
+
+    # --------------------------------------------------
+    # Submit SLURM jobs
+    # --------------------------------------------------
+    print("▶ [SLURM] submitting worker jobs")
+    print(f"  ↳ total jobs: {len(batches)}")
 
     # Submit SLURM jobs
     print(f"[SUBMIT] Submitting {len(batches)} SLURM jobs ({times_at_once} timesteps per job)")
-    job_prefix = f"lv_{lv_job_id}"
+    job_prefix = f"lv_{job_id}"
     expected = set()
 
     for batch in batches:
         start, end = batch[0], batch[-1]  # datetime.datetime, datetime.datetime
-        start_s, end_s = start.isoformat(), end.isoformat()  # str, str
+        start_s, end_s = _to_iso(start), _to_iso(end)
         expected.add((start_s, end_s))
 
         cmd = [
@@ -827,13 +877,16 @@ def submit_jobs(
             f"--dst-repo={dst_repo}",
             f"--dst-branch={dst_branch}",
             f"--aws-profile={aws_profile}",
-            f"--write-session-location={session_location}",
+            f"--fork-pickle={fork_pickle}",
         ]
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"sbatch failed:\n{res.stderr}")
 
+    print("  ✔ all SLURM jobs submitted")
+
+    print("▶ [SLURM] waiting for workers to finish")
     time.sleep(60)
 
     # Wait for jobs to finish
@@ -844,28 +897,33 @@ def submit_jobs(
         print(f"[SUBMIT] {job_count} jobs remaining ...")
         time.sleep(60)
 
-    # Merge sessions
-    print("[SUBMIT] All Jobs complete. Merging worker sessions...")
+    print("▶ [MERGE] collecting + merging worker sessions")
+
     time.sleep(10)
 
-    print("All jobs completed, gathering results...")
-    sessions = []
+    worker_forks = []
     for fspath in fs.ls(session_location):
-        filename = fspath.split("/")[-1]
-        if filename.startswith("lv_") and filename.endswith(".pickle"):
+        if fspath.endswith(".worker.pickle"):
+            print(f"  ↳ loading worker fork: {fspath}")
             with fs.open(fspath, "rb") as fobj:
-                sessions.append(pickle.load(fobj))
+                worker_forks.append(pickle.load(fobj))
         fs.rm(fspath)
-    merged_session = merge_sessions(base_session, *sessions)
+
+    print(f"  ↳ loaded {len(worker_forks)} worker forks")
+
+    print("  ▶ merging forks into base session")
+    base_session.merge(*worker_forks)
+    print("  ✔ forks merged")
 
     # Add Metadata
     valid_start = ds.init_time.values.min()
-    set_metadata(session=merged_session, start_time=valid_start, end_time=end_time)
+    set_metadata(session=base_session, start_time=valid_start, end_time=end_time)
 
     # Commit
-    msg = f"latent-vectorized {start_time.isoformat()} → {end_time.isoformat()}"
-    commit_id = commit_with_retries(session=merged_session, msg=msg)
-    print(f"[SUBMIT] Commit complete: {commit_id}")
+    msg = f"latent-vectorized {start_s} → {end_s}"
+    commit_id = commit_with_retries(session=base_session, msg=msg)
+    print(f"  ✔ commit complete: {commit_id}")
+    print("▶ [SUBMIT DONE]")
 
 
 if __name__ == "__main__":

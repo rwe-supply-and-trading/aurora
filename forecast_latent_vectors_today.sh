@@ -36,11 +36,8 @@ DST_BRANCH="$6"
 # --------------------------------------------------
 # Optional arguments
 # --------------------------------------------------
-LAT_MIN="${7:-}"
-LAT_MAX="${8:-}"
-LON_MIN="${9:-}"
-LON_MAX="${10:-}"
-INIT_HOUR="${11:-}"
+INIT_HOUR="${7:-}"
+ROLLOUT_STEPS="${8:-}"
 
 # --------------------------------------------------
 # Config
@@ -54,11 +51,8 @@ COORDINATION_LOCATION="s3://icechunk-write-coordination"
 # --------------------------------------------------
 EXTRA_ARGS=()
 
-[[ -n "$LAT_MIN"   ]] && EXTRA_ARGS+=(--lat-min "$LAT_MIN")
-[[ -n "$LAT_MAX"   ]] && EXTRA_ARGS+=(--lat-max "$LAT_MAX")
-[[ -n "$LON_MIN"   ]] && EXTRA_ARGS+=(--lon-min "$LON_MIN")
-[[ -n "$LON_MAX"   ]] && EXTRA_ARGS+=(--lon-max "$LON_MAX")
 [[ -n "$INIT_HOUR" ]] && EXTRA_ARGS+=(--init-hour "$INIT_HOUR")
+[[ -n "$ROLLOUT_STEPS"  ]] && EXTRA_ARGS+=(--rollout-steps "$ROLLOUT_STEPS")
 
 echo
 echo "================================================"
