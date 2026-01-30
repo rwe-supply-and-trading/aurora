@@ -139,13 +139,18 @@ static = xr.Dataset(
     },
     attrs={
         **ds.attrs,
-        "valid_times": 
         "source_repo": SRC_REPO,
         "source_branch": SRC_BRANCH,
         "lead_times": LEAD_TIMES,
         "init_hour": INIT_HOUR,
     },
 )
+
+static.attrs["valid_times"] = [
+    str(ds["valid_time"].values.min()),
+    str(ds["valid_time"].values.max()),
+]
+
 
 static.to_zarr(
     dst.store,
