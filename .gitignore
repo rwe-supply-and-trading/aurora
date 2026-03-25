@@ -44,3 +44,5 @@ mlrun/
 logs/
 
 channelize_data.py
+
+secrets.txt
