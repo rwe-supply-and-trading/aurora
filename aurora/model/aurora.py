@@ -262,8 +262,8 @@ class Aurora(torch.nn.Module):
             self.backbone.to(torch.bfloat16)
 
     def forward(
-        self, batch: Batch, lv_only: bool = False, return_latent: bool = False
-    ) -> Batch | torch.Tensor:
+        self, batch: Batch, return_latent: bool = False
+    ) -> Batch | tuple[Batch, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -320,37 +320,31 @@ class Aurora(torch.nn.Module):
         transformed_batch = self._pre_encoder_hook(transformed_batch)
 
         # The encoder is always just run.
-        x = self.encoder(
+        latent = self.encoder(
             transformed_batch,
             lead_time=self.timestep,
         )
 
         # In BF16 mode, the backbone is run in pure BF16.
         if self.bf16_mode:
-            x = x.to(torch.bfloat16)
-        x = self.backbone(
-            x,
+            latent = latent.to(torch.bfloat16)
+        latent = self.backbone(
+            latent,
             lead_time=self.timestep,
             patch_res=patch_res,
             rollout_step=batch.metadata.rollout_step,
         )
 
-        # ── NEW ADDITION: return only latent if requested ─────────
-
-        if lv_only:
-            return x
-        # ──────────────────────────────────────────────────────────
-
         # In BF16 mode, the decoder is run in AMP PF16, and the output is converted back to FP32.
         # We run in PF16 as opposed to BF16 for improved relative precision.
         if self.bf16_mode:
             context = torch.autocast(device_type="cuda", dtype=torch.float16)
-            x = x.to(torch.float16)
+            latent = latent.to(torch.float16)
         else:
             context = contextlib.nullcontext()
         with context:
             pred = self.decoder(
-                x,
+                latent,
                 batch,
                 lead_time=self.timestep,
                 patch_res=patch_res,
@@ -403,11 +397,8 @@ class Aurora(torch.nn.Module):
 
         pred = pred.unnormalise(surf_stats=self.surf_stats)
 
-        # ── NEW ADDITION: return (pred, latent) if requested ─────────
+        # ── return (pred, latent) if requested ─────────------------
         if return_latent:
-            # Again, you *could* choose to upcast the latent
-            # latent = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
-            latent = x
             return pred, latent
         # ───────────────────────────────────────────────────────────
 
