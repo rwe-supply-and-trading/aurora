@@ -175,7 +175,7 @@ def run_worker(start_time: str, end_time: str, store_path: str, src: str) -> Non
             client=arraylake.Client(),
         )
 
-    if src == "era5":
+    elif src == "era5":
         src_repo = "kafou/aurora-era5-samples"
         src_branch = "extend-2025"
         lve = LatentVectorExtractor(
