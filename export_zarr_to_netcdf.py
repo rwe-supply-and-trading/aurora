@@ -6,7 +6,6 @@ srun --exclusive --ntasks=1 --mem=0 python -u export_zarr_to_netcdf.py s3://icec
 
 import click
 import netCDF4
-import numpy as np
 import xarray as xr
 from obstore_utils import open_s3_zarr_store
 
@@ -31,47 +30,59 @@ def export(store_path: str, output_file: str, profile: str, step: int) -> None:
     if size_gb < 450:
         print("Dataset is small enough to load eagerly, skipping chunked write...")
         ds.load().to_netcdf(output_file, engine="netcdf4", mode="w")
-        print("Finished:", output_file)
-        return
 
-    n_times = ds.sizes["init_time"]
-    print(f"Total timesteps: {n_times}, writing {step} at a time")
+    else:
+        n_times = ds.sizes["init_time"]
+        print(f"Total timesteps: {n_times}, writing {step} at a time")
 
-    for i, start in enumerate(range(0, n_times, step)):
-        stop = min(start + step, n_times)
-        print(f"  Slice {i + 1}: init_time={start}:{stop}  ({stop - start} steps)...")
+        # Write the first chunk to initialize the file
+        # You could use netCDF4 for everything, but you'd need to manually
+        # create dimensions, variables, set attributes, handle encoding, etc.
+        # The hybrid approach leverages xarray's convenience for setup while
+        # using netCDF4's flexibility for appending.
+        print(f"  Slice 1: init_time=0:{min(step, n_times)}  ({min(step, n_times)} steps)...")
+        first_chunk = ds.isel(init_time=slice(0, step)).load()
 
-        chunk = ds.isel(init_time=slice(start, stop)).load()
-
-        if start == 0:
-            encoding = {
-                var: {
-                    "chunksizes": tuple(
-                        1 if dim == "init_time" else size
-                        for dim, size in zip(ds[var].dims, ds[var].shape)
-                    )
-                }
-                for var in ds.data_vars
+        encoding = {
+            var: {
+                "chunksizes": tuple(
+                    1 if dim == "init_time" else size
+                    for dim, size in zip(ds[var].dims, ds[var].shape)
+                )
             }
-            chunk.to_netcdf(
-                output_file,
-                engine="netcdf4",
-                mode="w",
-                unlimited_dims=["init_time"],
-                encoding=encoding,
-            )
-        else:
-            # Use netCDF4 directly — xarray validates chunk size on append
-            # and rejects the final slice when it's smaller than step.
+            for var in ds.data_vars
+        }
+        first_chunk.to_netcdf(
+            output_file,
+            engine="netcdf4",
+            mode="w",
+            unlimited_dims=["init_time"],
+            encoding=encoding,
+        )
+        del first_chunk
+
+        # Append remaining chunks using netCDF4 directly
+        for i, start in enumerate(range(step, n_times, step), start=2):
+            stop = min(start + step, n_times)
+            print(f"  Slice {i}: init_time={start}:{stop}  ({stop - start} steps)...")
+
+            chunk = ds.isel(init_time=slice(start, stop)).load()
+
             with netCDF4.Dataset(output_file, "a") as nc:
                 idx = nc.dimensions["init_time"].size
-                nc.variables["init_time"][idx:] = (
-                    chunk["init_time"].values.astype("datetime64[ns]").astype(np.int64)
+                times = chunk["init_time"].values.astype("datetime64[ns]")
+                nc.variables["init_time"][idx:] = netCDF4.date2num(
+                    times.astype("M8[ms]").astype(object),
+                    units=nc.variables["init_time"].units,
+                    calendar=nc.variables["init_time"].calendar,
                 )
                 for var in ds.data_vars:
                     nc.variables[var][idx:] = chunk[var].values
 
+            del chunk
+
     print("Finished:", output_file)
+    return
 
 
 if __name__ == "__main__":
