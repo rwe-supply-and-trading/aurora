@@ -1,5 +1,9 @@
+import logging
+
 import numpy as np
 import xarray as xr
+
+logger = logging.getLogger(__name__)
 
 
 def convert_aurora_to_greenwich(ds: xr.Dataset) -> xr.Dataset:
@@ -14,8 +18,8 @@ def convert_aurora_to_greenwich(ds: xr.Dataset) -> xr.Dataset:
         lat: [-89.75, 90] (ascending, 720 points)
         lon: [-180, 179.75] (Greenwich-centered, 1440 points)
     """
-    print(f"[CONVERT] Input: lat[0]={ds.lat.values[0]}, lat[-1]={ds.lat.values[-1]}")
-    print(f"[CONVERT] Input: lon[0]={ds.lon.values[0]}, lon[-1]={ds.lon.values[-1]}")
+    logger.info(f"[CONVERT] Input: lat[0]={ds.lat.values[0]}, lat[-1]={ds.lat.values[-1]}")
+    logger.info(f"[CONVERT] Input: lon[0]={ds.lon.values[0]}, lon[-1]={ds.lon.values[-1]}")
 
     # Flip latitude to ascending order: [90, -89.75] → [-89.75, 90]
     ds = ds.isel(lat=slice(None, None, -1))
@@ -26,7 +30,7 @@ def convert_aurora_to_greenwich(ds: xr.Dataset) -> xr.Dataset:
 
     # Find where to split: index of first lon >= 180 (which becomes negative)
     split_idx = int(np.argmax(old_lon >= 180))
-    print(f"[CONVERT] split_idx={split_idx} (lon[split_idx]={old_lon[split_idx]})")
+    logger.info(f"[CONVERT] split_idx={split_idx} (lon[split_idx]={old_lon[split_idx]})")
     # xarray's roll_coords=True has known bugs with this pattern
     # Roll data so negative longitudes come first, then positive
     ds = ds.roll(lon=-split_idx, roll_coords=False)
@@ -35,16 +39,8 @@ def convert_aurora_to_greenwich(ds: xr.Dataset) -> xr.Dataset:
     new_lon_sorted = np.concatenate([new_lon[split_idx:], new_lon[:split_idx]])
     ds = ds.assign_coords(lon=new_lon_sorted)
 
-    print(f"[CONVERT] Output: lat[0]={ds.lat.values[0]}, lat[-1]={ds.lat.values[-1]}")
-    print(f"[CONVERT] Output: lon[0]={ds.lon.values[0]}, lon[-1]={ds.lon.values[-1]}")
-
-    # Sanity checks
-    # assert ds.lat.values[0] < ds.lat.values[-1], "lat should be ascending"
-    # assert ds.lon.values[0] == -180.0, f"lon should start at -180, got {ds.lon.values[0]}"
-    # assert ds.lon.values[-1] == 179.75, f"lon should end at 179.75, got {ds.lon.values[-1]}"
-    # assert len(np.unique(ds.lon.values)) == len(ds.lon.values), "lon has duplicates!"
-    # assert len(np.unique(ds.lat.values)) == len(ds.lat.values), "lat has duplicates!"
-    # print("[CONVERT] ✓ All sanity checks passed")
+    logger.info(f"[CONVERT] Output: lat[0]={ds.lat.values[0]}, lat[-1]={ds.lat.values[-1]}")
+    logger.info(f"[CONVERT] Output: lon[0]={ds.lon.values[0]}, lon[-1]={ds.lon.values[-1]}")
 
     return ds
 
