@@ -4,10 +4,14 @@ conda activate aurora
 srun --exclusive --ntasks=1 --mem=0 python -u export_zarr_to_netcdf.py s3://icechunk-write-coordination/dedk-ecmwf /shared/rwx/data/sailboat/silly.nc
 """
 
+import logging
+
 import click
 import netCDF4
 import xarray as xr
 from obstore_utils import open_s3_zarr_store
+
+logger = logging.getLogger(__name__)
 
 
 @click.command()
@@ -17,30 +21,30 @@ from obstore_utils import open_s3_zarr_store
 @click.option("--step", default=3000, show_default=True, help="Timesteps per chunk")
 def export(store_path: str, output_file: str, profile: str, step: int) -> None:
     """Export a Zarr dataset to NetCDF, one slice at a time. No dask."""
-    print("Opening Zarr store...")
+    logger.info("Opening Zarr store...")
     store = open_s3_zarr_store(location=store_path, profile=profile, read_only=True)
 
-    print("Opening dataset (lazy, no dask)...")
+    logger.info("Opening dataset (lazy, no dask)...")
     ds = xr.open_zarr(store, consolidated=False, chunks=None)
-    print(ds)
+    logger.info(ds)
 
     size_gb = ds.nbytes / 1e9
-    print(f"Est. Dataset size: {size_gb:.1f} GB")
+    logger.info(f"Est. Dataset size: {size_gb:.1f} GB")
 
     if size_gb < 450:
-        print("Dataset is small enough to load eagerly, skipping chunked write...")
+        logger.info("Dataset is small enough to load eagerly, skipping chunked write...")
         ds.load().to_netcdf(output_file, engine="netcdf4", mode="w")
 
     else:
         n_times = ds.sizes["init_time"]
-        print(f"Total timesteps: {n_times}, writing {step} at a time")
+        logger.info(f"Total timesteps: {n_times}, writing {step} at a time")
 
         # Write the first chunk to initialize the file
         # You could use netCDF4 for everything, but you'd need to manually
         # create dimensions, variables, set attributes, handle encoding, etc.
         # The hybrid approach leverages xarray's convenience for setup while
         # using netCDF4's flexibility for appending.
-        print(f"  Slice 1: init_time=0:{min(step, n_times)}  ({min(step, n_times)} steps)...")
+        logger.info(f"  Slice 1: init_time=0:{min(step, n_times)}  ({min(step, n_times)} steps)...")
         first_chunk = ds.isel(init_time=slice(0, step)).load()
 
         encoding = {
@@ -64,7 +68,7 @@ def export(store_path: str, output_file: str, profile: str, step: int) -> None:
         # Append remaining chunks using netCDF4 directly
         for i, start in enumerate(range(step, n_times, step), start=2):
             stop = min(start + step, n_times)
-            print(f"  Slice {i}: init_time={start}:{stop}  ({stop - start} steps)...")
+            logger.info(f"  Slice {i}: init_time={start}:{stop}  ({stop - start} steps)...")
 
             chunk = ds.isel(init_time=slice(start, stop)).load()
 
@@ -81,7 +85,7 @@ def export(store_path: str, output_file: str, profile: str, step: int) -> None:
 
             del chunk
 
-    print("Finished:", output_file)
+    logger.info("Finished:", output_file)
     return
 
 
