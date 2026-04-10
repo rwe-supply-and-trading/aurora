@@ -18,6 +18,11 @@ def convert_aurora_to_greenwich(ds: xr.Dataset) -> xr.Dataset:
         lat: [-89.75, 90] (ascending, 720 points)
         lon: [-180, 179.75] (Greenwich-centered, 1440 points)
     """
+    # check if already in correct format (e.g. from previous conversion)
+    if ds.lat.values[0] < ds.lat.values[-1] and ds.lon.values[0] < 0 and ds.lon.values[-1] < 180:
+        logger.info("[CONVERT] Dataset already in Greenwich-centered format, skipping conversion.")
+        return ds
+
     logger.info(f"[CONVERT] Input: lat[0]={ds.lat.values[0]}, lat[-1]={ds.lat.values[-1]}")
     logger.info(f"[CONVERT] Input: lon[0]={ds.lon.values[0]}, lon[-1]={ds.lon.values[-1]}")
 
