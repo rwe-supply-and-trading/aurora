@@ -210,7 +210,7 @@ def run_worker(*, start_time: str, end_time: str, store_path: str, src: str) -> 
     init_times = ds_store.init_time.sel(init_time=slice(start_time, end_time)).values
 
     logger.info(
-        f"[WORKER] Store spatial_indicies: [{spatial_indices[0:3]} ... {spatial_indices[-3:-1]}], len={len(spatial_indices)}"
+        f"[WORKER] Store spatial_indicies: [{spatial_indices[0:3]} ... {spatial_indices[-3:]}], len={len(spatial_indices)}"
     )
 
     # Instantiate LV Extractors
