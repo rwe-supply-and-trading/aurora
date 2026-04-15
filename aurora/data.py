@@ -14,51 +14,6 @@ import xarray as xr
 from aurora import Batch, Metadata
 
 
-def batch_to_ds(batch: Batch) -> xr.Dataset:
-    """
-    Convert an Aurora Batch object to an xarray dataset for convenience.
-
-    Args:
-        batch: aurora.Batch object
-
-    Returns:
-        An xarray.Dataset object
-
-    """
-    coord_data = {
-        "latitude": xr.DataArray(batch.metadata.lat, dims=("latitude",)),
-        "longitude": xr.DataArray(batch.metadata.lon, dims=("longitude",)),
-        "level": xr.DataArray(np.array(batch.metadata.atmos_levels), dims=("level",)),
-        "time": xr.DataArray(np.array(batch.metadata.time), dims=("time",)),
-    }
-
-    data_vars = {}
-
-    data_vars.update(
-        {
-            dv: xr.DataArray(
-                batch.surf_vars[dv],
-                dims=("batch", "time", "latitude", "longitude"),
-                coords={c: coord_data[c] for c in ("latitude", "longitude", "time")},
-            )
-            for dv in batch.surf_vars
-        }
-    )
-
-    data_vars.update(
-        {
-            dv: xr.DataArray(
-                batch.atmos_vars[dv],
-                dims=("batch", "time", "level", "latitude", "longitude"),
-                coords={c: coord_data[c] for c in ("latitude", "longitude", "level", "time")},
-            )
-            for dv in batch.atmos_vars
-        }
-    )
-
-    return xr.Dataset(data_vars)
-
-
 class ERA5DataLoaderFOAM:
     """
     An ERA5 data loader.
