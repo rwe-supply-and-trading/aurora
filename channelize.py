@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 """
-
 conda activate aurora
 
 # 14 days worth of 6h timesteps
@@ -14,7 +13,6 @@ python -u channelize.py submit-jobs 2025-11-30T18:00:00 2026-03-31T18:00:00 \
     --times-at-once 56 \
     --cpus 4 \
     --coordination-location s3://icechunk-write-coordination/extend-era5-samples
-
 """
 
 import datetime
@@ -54,9 +52,7 @@ REPO_CONFIG = icechunk.RepositoryConfig.default()
 
 # Storage-level config: network timeout tuning.
 # minimum_throughput_bytes_per_second=0 disables the throughput floor check.
-STORAGE_OPTIONS: dict = {
-    "network_stream_timeout_seconds": 600,
-}
+STORAGE_OPTIONS: dict = {"network_stream_timeout_seconds": 600}
 
 INVARIANT_REPO = "rwe/era5-0p25-6h-nonprod-ohio"
 S3_PROFILE = "kafou"
