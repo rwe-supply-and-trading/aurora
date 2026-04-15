@@ -25,6 +25,16 @@ def initialize_dataset(
     """
     Initialize forecast store with coords + empty `normalized_sample`.
 
+    Args:
+        - store: Zarr store to initialize (e.g. S3 path)
+        - init_times: Array of initialization times (datetime64)
+        - rollout_steps: Number of forecast steps (e.g. 16 for 6-hourly steps up to 4 days)
+        - lat_range: Optional tuple specifying (min_lat, max_lat) for spatial subsetting
+        - lon_range: Optional tuple specifying (min_lon, max_lon) for spatial subsetting
+
+    Returns:
+        - None
+
     Creates:
         Dimensions:         (feature=72, init_time=N, lead_time=rollout, lat=720, lon=1440)
         Coordinates:
@@ -93,8 +103,8 @@ def initialize_dataset(
             "rollout_steps": int(rollout_steps),
             "lead_times": lead_times.tolist(),
             "spatial_subset_type": ("bounding_box" if lat_range and lon_range else "global"),
-            "lat_range": (lat_range if lat_range and lon_range else None),
-            "lon_range": (lon_range if lat_range and lon_range else None),
+            "lat_range": (list(lat_range) if lat_range and lon_range else None),
+            "lon_range": (list(lon_range) if lat_range and lon_range else None),
         },
     )
 
@@ -115,7 +125,6 @@ def initialize_dataset(
 
     root = zarr.open_group(store, mode="a", zarr_format=3)
     root.create_array(
-        store,
         name="normalized_sample",
         shape=(len(init_times), len(lead_times), len(lat), len(lon), n_feature),
         chunks=(1, len(lead_times), 128, 128, 128),
@@ -135,7 +144,17 @@ def initialize_dataset(
 # ------------------------------------------------------
 # RAW Worker
 # ------------------------------------------------------
-def run_worker(start_time: str, end_time: str, store_path: str, src: str) -> None:
+def run_worker(*, start_time: str, end_time: str, store_path: str, src: str) -> None:
+    """Worker function to generate forecasts for a given time range and store in Zarr.
+
+    Args:
+        - start_time (str): Start of the time range (inclusive) in ISO format, e.g. "2024-01-01T00:00:00Z"
+        - end_time (str): End of the time range (inclusive) in ISO format, e.g. "2024-01-31T18:00:00Z"
+        - store_path (str): S3 path to the Zarr store, e.g. "s3://my-bucket/forecast.zarr"
+        - src (str): Source dataset to use for forecasts, either "ecmwf" or "era5"
+    Returns:
+        - None
+    """
     store = open_s3_zarr_store(location=store_path, profile="kafou")
 
     # Get coordinate information from Store
@@ -172,7 +191,7 @@ def run_worker(start_time: str, end_time: str, store_path: str, src: str) -> Non
         raise ValueError(f"Unknown source: {src}. Must be 'ecmwf' or 'era5'")
 
     for init_time in init_times:
-        logger.info("Processing:", init_time, flush=True)
+        logger.info(f"Processing: {init_time}")
 
         lv_ds = lve.rollout(
             item=init_time.astype("datetime64[s]").item(),
@@ -212,3 +231,5 @@ def run_worker(start_time: str, end_time: str, store_path: str, src: str) -> Non
             mode="r+",
             region="auto",
         )
+
+    logger.info("[WORKER] Worker complete.")
