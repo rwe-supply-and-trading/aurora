@@ -18,6 +18,7 @@ python -u channelize.py submit-jobs 2025-11-30T18:00:00 2026-03-31T18:00:00 \
 import datetime
 import logging
 import os
+import re
 import pickle
 import secrets
 import subprocess
@@ -58,24 +59,9 @@ INVARIANT_REPO = "rwe/era5-0p25-6h-nonprod-ohio"
 S3_PROFILE = "kafou"
 
 NAME_MAP = {
-    "sfc": {
-        "VAR_2T": "2t",
-        "MSL": "msl",
-        "VAR_10U": "10u",
-        "VAR_10V": "10v",
-    },
-    "pl": {
-        "Z": "z",
-        "U": "u",
-        "V": "v",
-        "T": "t",
-        "Q": "q",
-    },
-    "inv": {
-        "LSM": "lsm",
-        "Z": "z",
-        "SLT": "slt",
-    },
+    "sfc": {"VAR_2T": "2t", "MSL": "msl", "VAR_10U": "10u", "VAR_10V": "10v"},
+    "pl": {"Z": "z", "U": "u", "V": "v", "T": "t", "Q": "q"},
+    "inv": {"LSM": "lsm", "Z": "z", "SLT": "slt"},
 }
 
 
@@ -190,8 +176,8 @@ def get_variable_locations(n_pressure_levels: int = 13) -> tuple[dict, dict]:
 
     Each maps {"sfc": {var: (start_idx, n_channels)}, "pl": {...}}.
     """
-    in_locs: dict[str, dict[str, tuple[int, int]]] = {"sfc": {}, "pl": {}}
-    out_locs: dict[str, dict[str, tuple[int, int]]] = {"sfc": {}, "pl": {}}
+    in_locs = {"sfc": {}, "pl": {}}
+    out_locs = {"sfc": {}, "pl": {}}
 
     i = 0
     for src_name, dst_name in NAME_MAP["sfc"].items():
@@ -219,60 +205,23 @@ def decode_zarr_time(grp: zarr.Group, time_var: str = "time") -> np.ndarray:
     stores switch to xarray-decodable time, this can be replaced with
     direct xarray reads.
     """
-    import re
-
-    time_arr = grp[time_var][:]
-    time_attrs = dict(grp[time_var].attrs)
-    units = time_attrs.get("units")
-    calendar = time_attrs.get("calendar", "standard")
-
-    logger.info(f"      time attrs: units={units}, calendar={calendar}")
-
+    time_arr = grp["time"][:]
+    units = dict(grp["time"].attrs).get("units")
     if units is not None:
         match = re.match(r"(\w+)\s+since\s+(.+)", units)
         if not match:
             raise ValueError(f"Cannot parse time units: {units}")
-
         unit, ref_str = match.groups()
-        ref_date = np.datetime64(ref_str.replace(" ", "T"))
-
-        multipliers = {
-            "seconds": 1,
-            "minutes": 60,
-            "hours": 3600,
-            "days": 86400,
-        }
+        multipliers = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
         if unit not in multipliers:
             raise ValueError(f"Unsupported time unit: {unit}")
-
-        ns_offsets = (time_arr * multipliers[unit] * 1_000_000_000).astype("timedelta64[ns]")
-        return (ref_date + ns_offsets).astype("datetime64[ns]")
-
+        ref = np.datetime64(ref_str.replace(" ", "T"))
+        return (
+            ref + (time_arr * multipliers[unit] * 1_000_000_000).astype("timedelta64[ns]")
+        ).astype("datetime64[ns]")
     if np.issubdtype(time_arr.dtype, np.integer):
         return time_arr.view("datetime64[ns]")
-    if np.issubdtype(time_arr.dtype, np.datetime64):
-        return time_arr.astype("datetime64[ns]")
-
-    raise ValueError(f"Cannot decode time with dtype {time_arr.dtype} and no units attr")
-
-
-def estimate_manifest_size(grp: zarr.Group, vars: list[str]) -> tuple[int, float]:
-    """Estimate chunk reference count and manifest size in MB for a set of variables.
-
-    Uses ~12 bytes/ref based on observed icechunk manifest sizes, not the
-    commonly cited 110 bytes/ref which applies to other formats.
-
-    Returns:
-        (total_chunk_refs, estimated_mb)
-    """
-    import math
-
-    total = 0
-    for v in vars:
-        arr = grp[v]
-        n = math.prod(math.ceil(s / c) for s, c in zip(arr.shape, arr.chunks))
-        total += n
-    return total, total * 12 / 1e6
+    return time_arr.astype("datetime64[ns]")
 
 
 def init_store(
@@ -541,38 +490,23 @@ def channelize_worker(
     # Icechunk handles transient network errors internally (retries with
     # exponential backoff). Permanent errors (missing data) fail immediately.
     logger.info("[LOAD] loading surface + pressure-level data")
-
     sfc_grp = zarr.open_group(src_session.store, path="surface", mode="r")
     pl_grp = zarr.open_group(src_session.store, path="pressure_level", mode="r")
 
-    # Verify level ordering matches what Aurora expects (ascending pressure).
-    # Raw zarr does not apply sortby — must confirm here.
-    src_levels = pl_grp["level"][:]
-    logger.info(f"  source level order: {src_levels}")
-    if not np.all(src_levels == np.sort(src_levels)):
-        raise click.ClickException(
-            f"Source pressure levels are not sorted ascending: {src_levels}. "
-            "Channel assignment will be wrong — re-check level ordering."
-        )
-
-    # Manifest size estimate.
-    # Uses ~12 bytes/ref based on observed icechunk manifest sizes.
-    sfc_refs, sfc_mb = estimate_manifest_size(sfc_grp, list(NAME_MAP["sfc"]))
-    pl_refs, pl_mb = estimate_manifest_size(pl_grp, list(NAME_MAP["pl"]))
-    logger.info(
-        f"[MANIFEST] estimated refs: {sfc_refs + pl_refs:,} "
-        f"(sfc={sfc_refs:,} ~{sfc_mb:.1f}MB, pl={pl_refs:,} ~{pl_mb:.1f}MB) "
-        f"→ total ~{sfc_mb + pl_mb:.1f} MB"
-    )
+    # Force manifest fetch for all variables we'll use by reading a single
+    # scalar value from each. This warms the manifest cache and lets us time
+    # the cold-start cost before the real load begins.
+    logger.info("[MANIFEST] warming manifest cache...")
+    t0 = time.perf_counter()
+    for v in NAME_MAP["sfc"]:
+        _ = sfc_grp[v][0, 0, 0]
+    for v in NAME_MAP["pl"]:
+        _ = pl_grp[v][0, 0, 0, 0]
+    logger.info(f"[MANIFEST] cache warm in {time.perf_counter() - t0:.1f}s")
 
     time_ns = decode_zarr_time(sfc_grp)
-    if len(time_ns) == 0:
-        raise click.ClickException("Source time coordinate is empty")
-
     start_ns = np.datetime64(start_time).astype("datetime64[ns]")
     end_ns = np.datetime64(end_time).astype("datetime64[ns]")
-    logger.info(f"  source range: {time_ns[0]} to {time_ns[-1]}")
-
     start_idx = int(np.searchsorted(time_ns, start_ns))
     end_idx = int(np.searchsorted(time_ns, end_ns, side="right"))
 

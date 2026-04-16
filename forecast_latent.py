@@ -167,6 +167,12 @@ def initialize_dataset(
     )
 
     # Open existing group (preserves attrs) and add array
+    # zarr.create_array(fill_value=np.nan) does not allocate or write any chunk data at all.
+    # It only writes a small metadata file (zarr.json) with  the array's shape, chunks, dtype,
+    # fill_value, and dimension names. This is an O(1) operation regardless of array size.
+    # When a Zarr reader later encounters an unwritten chunk, it returns the fill_value (NaN
+    # automatically — this is a core Zarr design principle called "virtual fill."
+    # No physical storage is consumed for chunks that have never been written to.
     root = zarr.open_group(store, mode="a", zarr_format=3)
     root.create_array(
         name="lv",

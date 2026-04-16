@@ -104,7 +104,7 @@ def submit_jobs(*, start_time: str, end_time: str, store_path: str, src: str, mo
             "--ntasks=1",
             "--cpus-per-task=32",
             "--gpus=1",
-            f"--job-name={mode}_{start}_{end}",
+            f"--job-name=aurora_{mode}_{start}_{end}",
             "--wrap",
             f"python {sys.argv[0]} worker {mode} {start} {end} {store_path} {src}",
         ]
