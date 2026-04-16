@@ -1,193 +1,21 @@
 """Utilities to manage read/write of data using arraylake/icechunk/zarr."""
 
 import logging
-import os
 from datetime import datetime, timedelta
-from typing import Literal, Optional, Union
+from typing import Literal, Union
 
 try:
     import kafou_arraylake as arraylake
 except ImportError:
-    import arraylake
+    pass
 import cftime
-import icechunk
 import numpy as np
 import pandas as pd
 import xarray as xr
 import zarr.abc.store
 import zarr.codecs
-from icechunk import IcechunkError
-
-# from rwx_pmf.ecmwf_grib import (
-#     DEFAULT_PRESSURE_LEVELS_TO_EXTRACT,
-#     interpolate_missing_pressure_levels,
-# )
-
-ARRAYLAKE_IC_REPO_NAME: str = "rwe/model-ecmwf-t0-nonprod-frankfurt"
-ARRAYLAKE_IC_ZARR_GROUP_NAME: str = "ENFO-T0"
 
 logger = logging.getLogger(__name__)
-
-
-def init_ifs_dataset(
-    store: zarr.abc.store.Store,
-    start_time: Union[datetime, np.datetime64],
-    end_time: Union[datetime, np.datetime64],
-    *,
-    time_resolution: Optional[Union[timedelta, np.timedelta64]] = None,
-    group: Optional[str] = None,
-) -> None:
-    """Initializes an IFS dataset and stores it in the specified Zarr store.
-
-    The dataset includes metadata and multidimensional arrays for meteorological variables.
-    This function sets up the coordinates, such as time, pressure levels, latitude, longitude,
-    and ensemble members, with their respective resolutions, and configures the
-    arrays for storing the data.
-
-    This function is mostly useful during development and testing and is included to document
-    the general way in which the production data store was initialized.
-
-    Args:
-        store (zarr.abc.store.Store): The Zarr store where the dataset will be saved.
-        start_time (Union[datetime, np.datetime64]): The starting time of the dataset.
-        end_time (Union[datetime, np.datetime64]): The ending time of the dataset.
-        time_resolution (Optional[Union[timedelta, np.timedelta64]]): Temporal
-            resolution for the dataset. If not provided, it defaults to the entire
-            time span.
-        group (Optional[str]): The Zarr group where the dataset will be saved within
-            the store.
-    """
-    if isinstance(start_time, datetime):
-        start_time = np.datetime64(start_time)
-    if isinstance(end_time, datetime):
-        end_time = np.datetime64(end_time)
-
-    start_time = start_time.astype("datetime64[ns]")
-    end_time = end_time.astype("datetime64[ns]")
-
-    if time_resolution is None:
-        time_resolution = end_time - start_time
-        if time_resolution == np.timedelta64(0, "ns"):
-            time_resolution = np.timedelta64(1, "ns")
-    elif isinstance(time_resolution, timedelta):
-        time_resolution = np.timedelta64(time_resolution)
-
-    time_data = np.arange(start_time, end_time + time_resolution, time_resolution)
-    pressure_level_data = np.array(
-        [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000], dtype=np.int64
-    )
-    lat_data = np.arange(90.0, -90.25, -0.25, dtype=np.float64)
-    lon_data = np.arange(0.0, 360.0, 0.25, dtype=np.float64)
-    ensemble_member_data = np.arange(0, 52, 1, dtype=np.int64)
-
-    ds = xr.Dataset(
-        coords={
-            "ensemble_member": xr.DataArray(ensemble_member_data, dims=("ensemble_member",)),
-            "lat": xr.DataArray(lat_data, dims=("lat",)),
-            "lon": xr.DataArray(lon_data, dims=("lon",)),
-            "pressure_level": xr.DataArray(pressure_level_data, dims=("pressure_level",)),
-            "time": xr.DataArray(time_data, dims=("time",)),
-        }
-    )
-
-    ds.to_zarr(
-        store,
-        group=group,
-        zarr_format=3,
-        consolidated=False,
-        encoding={
-            "ensemble_member": {"chunks": (len(ds.ensemble_member),)},
-            "lat": {"chunks": (len(ds.lat),)},
-            "lon": {"chunks": (len(ds.lon),)},
-            "pressure_level": {"chunks": (len(ds.pressure_level),)},
-            "time": {"chunks": (10000,)},
-        },
-    )
-
-    zgroup = zarr.open_group(store, path=group)
-    compressors = [zarr.codecs.BloscCodec(clevel=3, shuffle="bitshuffle")]
-
-    for varname in (
-        "d2m",
-        "ps",
-        "slp",
-        "t2m",
-        "u100m",
-        "u10m",
-        "v100m",
-        "v10m",
-    ):
-        zgroup.create_array(
-            name=varname,
-            shape=(len(ds.time), len(ds.ensemble_member), len(ds.lat), len(ds.lon)),
-            chunks=(1, 1, len(ds.lat), len(ds.lon)),
-            dtype=np.float32,
-            fill_value=np.nan,
-            compressors=compressors,
-            dimension_names=("time", "ensemble_member", "lat", "lon"),
-        )
-
-    for varname in ("q", "t", "u", "v", "z"):
-        zgroup.create_array(
-            name=varname,
-            shape=(
-                len(ds.time),
-                len(ds.ensemble_member),
-                len(ds.pressure_level),
-                len(ds.lat),
-                len(ds.lon),
-            ),
-            chunks=(1, 1, 1, len(ds.lat), len(ds.lon)),
-            dtype=np.float32,
-            fill_value=np.nan,
-            compressors=compressors,
-            dimension_names=("time", "ensemble_member", "pressure_level", "lat", "lon"),
-        )
-
-
-def get_icechunk_session(
-    repo: str,
-    readonly_session: bool = False,
-    branch: str = "main",
-) -> icechunk.session.Session:
-    """Get an icechunk session based on the parameters provided.
-
-    If a requested repo does not exist, it will raise a ValueError.
-
-    Args:
-        repo: The path to the icechunk repository.
-        readonly_session: Set to True to load return a readonly session instead
-           of a writable session (default).
-        branch: Optional branch instead of "main".
-
-    Returns:
-        An icechunk session object of the requested mode (writable or readonly).
-    """
-    if repo.startswith("kafou/") or repo.startswith("rwe/"):
-        # This is an icechunk repo on object store
-        client = arraylake.Client(token=os.environ.get("ARRAYLAKE_TOKEN", None))
-        try:
-            repository = client.get_repo(repo)
-        except IcechunkError as ierr:
-            raise KeyError(
-                f"Tried to access this repo on S3 arraylake but it did "
-                f"not exist: {repo}.  You must have manually created the repo on S3 "
-                f"arraylake (including selecting the appropriate bucket, etc.) "
-                f"to write to the S3 arraylake repo."
-            ) from ierr
-    else:
-        # This is an icechunk store on local disk (not managed by arraylake)
-        storage = icechunk.local_filesystem_storage(repo)
-        repository = icechunk.Repository.open(storage)
-
-    # Get session of appropriate type
-    session = (
-        repository.readonly_session(branch)
-        if readonly_session
-        else repository.writable_session(branch)
-    )
-
-    return session
 
 
 def encode_datetimes_following_cf_conventions(
@@ -216,6 +44,7 @@ def ensure_time_in_arrays(
     *,
     time_dim: str = "time",
     time_frequency: Union[str, timedelta, Literal["auto"]] = "auto",
+    init_hour: int | None = None,
     group: str | None = None,
 ) -> str | None:
     """Update the arrays in a Zarr group to ensure the given timestamp exists in a coordinate.
@@ -319,6 +148,16 @@ def ensure_time_in_arrays(
         start=ds[time_dim].values[-1], end=timestamp, freq=time_frequency
     )[1:]
 
+    # ------------------------------
+    # init_hour filtering
+    # ------------------------------
+    if init_hour is not None:
+        datetimes_to_append = datetimes_to_append[datetimes_to_append.hour == init_hour]
+
+    if len(datetimes_to_append) == 0:
+        logger.info(f"No datetimes to append after init_hour={init_hour} filtering.")
+        return None
+
     # Also figure out which variables will have to be extended
     variables_to_adjust = []
     for var in ds.data_vars:
@@ -347,8 +186,6 @@ def ensure_time_in_arrays(
     # Now we do the actual appending of the time coordinates.
     # This will adjust the Zarr data.
     time_coord_array.append(encoded_times_to_append)
-    time_coord_array.attrs.clear()
-    time_coord_array.attrs.update(time_coord_attrs)
 
     # We now need to adjust all data variables that had the time dimension
     # as a dimension.  We use this by doing a "resize" on the zarr arrays,
@@ -360,10 +197,7 @@ def ensure_time_in_arrays(
         # Add the number of new times to the appropriate dimension
         current_shape[dim_index] += num_new_times
         # Resize
-        var_attrs = dict(zarr_array.attrs)
         zarr_array.resize(tuple(current_shape))
-        zarr_array.attrs.clear()
-        zarr_array.attrs.update(var_attrs)
 
     # Commit the changes if we have a session
     commit_message = (
@@ -372,121 +206,3 @@ def ensure_time_in_arrays(
     )
     logger.info(commit_message)
     return commit_message
-
-
-# def get_arraylake_ic_pair(
-#     init_time: datetime,
-#     ensemble_number: int,
-#     hours_back: int = 6,
-# ) -> xr.Dataset:
-#     """Loads and normalises initial conditions from arraylake.
-
-#     This function provides a handy interface for getting the initial conditions pair required to
-#     initialise the aurora simulation. The expected use of this is to produce an xarray dataset
-#     that is ready to create an aurora batch object from.
-
-#     **This function should ONLY be used when expecting a initial condition pair
-#     from init_time and init_time - 6 hours.**
-
-#     This function handles the the pressure levels by removing any that are NaN in the input
-#     and removing them. Once they are removed, they are interpolated by the
-#     `interpolate_missing_pressure_levels` function.
-
-#     Args:
-#         init_time: The initialisation time for the dataset.
-#         ensemble_number: The ensemble member number.
-#         hours_back: how many hours back the pair should be fetched.
-#                     Defaults to 6 as that is the aurora requirement
-
-#     Returns:
-#         xarray dataset containing the initial condition data for both init time & init time - 6.
-#     """
-#     session = get_icechunk_session(ARRAYLAKE_IC_REPO_NAME, readonly_session=True)
-
-#     dset = xr.open_zarr(
-#         session.store,
-#         group=ARRAYLAKE_IC_ZARR_GROUP_NAME,
-#         consolidated=False,
-#         decode_timedelta=True,
-#     )
-
-#     prior_dt = init_time - timedelta(hours=hours_back)
-
-#     try:
-#         # always need a time & ensemble member to produce a 1x721x1440x<pressure_levels>
-#         levels = list(DEFAULT_PRESSURE_LEVELS_TO_EXTRACT)
-#         current_ics = dset.sel(
-#             time=init_time,
-#             ensemble_member=ensemble_number,
-#             pressure_level=levels,
-#         ).reindex(pressure_level=levels)
-#         prior_ics = dset.sel(
-#             time=prior_dt,
-#             ensemble_member=ensemble_number,
-#             pressure_level=levels,
-#         ).reindex(pressure_level=levels)
-
-#     except KeyError as e:
-#         raise KeyError(
-#             f"Could not find data for init_time {init_time},"
-#             f"ensemble_member {ensemble_number}"
-#             f"in arraylake repo {ARRAYLAKE_IC_REPO_NAME} "
-#             f"and group {ARRAYLAKE_IC_ZARR_GROUP_NAME}. "
-#             f"Please check that the requested data exists."
-#         ) from e
-
-#     # rename the co-ordinates
-#     # interpolate function demands pressure levels be called "level"
-#     prior_ics = prior_ics.rename(
-#         {"lat": "latitude", "lon": "longitude", "pressure_level": "level"}
-#     )
-#     current_ics = current_ics.rename(
-#         {"lat": "latitude", "lon": "longitude", "pressure_level": "level"}
-#     )
-
-#     # Remove any pressure levels that are all NaN by only selecting
-#     # pressure levels where no NaN data is present.
-#     # Assumes temperature variable is included and missing
-#     # data in temperature is representative of all other pressure
-#     # level data
-#     prior_levels_initial = len(prior_ics["level"])
-#     current_levels_initial = len(current_ics["level"])
-#     print(
-#         f"Initial pressure levels - Prior IC: {prior_levels_initial}, "
-#         f"Current IC: {current_levels_initial}"
-#     )
-
-#     prior_ics = prior_ics.sel(
-#         level=(prior_ics["t"].isnull().sum(dim=("latitude", "longitude")) == 0)
-#     )
-#     current_ics = current_ics.sel(
-#         level=(current_ics["t"].isnull().sum(dim=("latitude", "longitude")) == 0)
-#     )
-
-#     # Check if we have any pressure levels left.  If not, it means
-#     # that the initial condition data was NaN for all pressure levels,
-#     # so abort
-#     if len(prior_ics.level) == 0 or len(current_ics.level) == 0:
-#         raise ValueError(
-#             f"Initial condition data for init_time {init_time} or "
-#             f"prior time {prior_dt} "
-#             f"ensemble_member {ensemble_number} "
-#             f"in arraylake repo {ARRAYLAKE_IC_REPO_NAME} "
-#             f"and group {ARRAYLAKE_IC_ZARR_GROUP_NAME} "
-#             f"was NaN for all pressure levels. Cannot proceed."
-#         )
-
-#     prior_levels_filtered = len(prior_ics["level"])
-#     current_levels_filtered = len(current_ics["level"])
-#     print(
-#         f"NaN pressure levels - Prior IC: {prior_levels_filtered}, "
-#         f"Current IC: {current_levels_filtered}"
-#     )
-
-#     # Now, backfill missing levels
-#     prior_ics = interpolate_missing_pressure_levels(prior_ics)
-#     current_ics = interpolate_missing_pressure_levels(current_ics)
-
-#     ic_dset = xr.concat([prior_ics, current_ics], dim="time")
-
-#     return ic_dset
