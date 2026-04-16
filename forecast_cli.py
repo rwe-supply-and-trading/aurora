@@ -16,7 +16,6 @@ xr.set_options(keep_attrs=True)
 
 
 logger = logging.getLogger(__name__)
-xr.set_options(keep_attrs=True)
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
