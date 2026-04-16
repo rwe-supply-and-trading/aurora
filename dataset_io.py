@@ -44,7 +44,7 @@ def ensure_time_in_arrays(
     *,
     time_dim: str = "time",
     time_frequency: Union[str, timedelta, Literal["auto"]] = "auto",
-    init_hour: int | None = None,  # <-- ADD
+    init_hour: int | None = None,
     group: str | None = None,
 ) -> str | None:
     """Update the arrays in a Zarr group to ensure the given timestamp exists in a coordinate.
