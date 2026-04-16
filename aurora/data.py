@@ -248,7 +248,7 @@ class ECMWFDataLoaderFOAM:
 
         # Iterate over batches, getting latent vectors.
         for batch in loader:
-            pred = model.forward(batch, lv_only=True)
+            pred = model.forward(batch, return_latent=True)
             ...
     """
 
