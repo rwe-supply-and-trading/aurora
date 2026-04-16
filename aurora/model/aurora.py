@@ -261,7 +261,7 @@ class Aurora(torch.nn.Module):
             # We run the backbone in pure BF16.
             self.backbone.to(torch.bfloat16)
 
-    def forward(self, batch: Batch, lv_only: bool = False) -> Batch | torch.Tensor:
+    def forward(self, batch: Batch, return_latent: bool = False) -> Batch | torch.Tensor:
         """Forward pass.
 
         Args:
@@ -333,9 +333,6 @@ class Aurora(torch.nn.Module):
             rollout_step=batch.metadata.rollout_step,
         )
 
-        if lv_only:
-            return x
-
         # In BF16 mode, the decoder is run in AMP PF16, and the output is converted back to FP32.
         # We run in PF16 as opposed to BF16 for improved relative precision.
         if self.bf16_mode:
@@ -397,6 +394,9 @@ class Aurora(torch.nn.Module):
             )
 
         pred = pred.unnormalise(surf_stats=self.surf_stats)
+
+        if return_latent:
+            return pred, x  # pred, latent
 
         return pred
 
