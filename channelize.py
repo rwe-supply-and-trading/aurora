@@ -9,7 +9,7 @@ python -u channelize.py submit-jobs 2025-11-30T18:00:00 2026-03-31T18:00:00 \
     --src-branch main \
     --dst-repo kafou/aurora-era5-samples \
     --dst-branch extend-2025 \
-    --token ema_538dadd713b94095ad24386973e7b109_fbc2a0d2fae4df6553e6d6abbfb3f66130139de2707f3021e07e6dbb39890ef3 \
+    --token "$ARRAYLAKE_TOKEN" \
     --times-at-once 56 \
     --cpus 4 \
     --coordination-location s3://icechunk-write-coordination/extend-era5-samples
