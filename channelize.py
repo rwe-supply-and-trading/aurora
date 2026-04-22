@@ -3,22 +3,31 @@
 """
 conda activate aurora
 
-# 14 days worth of 6h timesteps
-python -u channelize.py submit-jobs 2025-11-30T18:00:00 2026-03-31T18:00:00 \
+# Initialize the destination zarr v3 store
+python -u channelize.py init \
+    --start-time 2025-01-01T00:00:00 \
+    --end-time 2025-01-31T18:00:00 \
     --src-repo rwe/era5-0p25-6h-nonprod-ohio \
     --src-branch main \
-    --dst-repo kafou/aurora-era5-samples \
-    --dst-branch extend-2025 \
+    --dst-store s3://kafou-data/tutorial-channel.zarr \
     --token "$ARRAYLAKE_TOKEN" \
-    --times-at-once 56 \
-    --cpus 4 \
-    --coordination-location s3://icechunk-write-coordination/extend-era5-samples
+    --force-init
+
+# Submit distributed channelization jobs. Re-running the same command after
+# a partial failure skips batches whose done marker already exists.
+python -u channelize.py submit-jobs \
+    2025-01-01T00:00:00 \
+    2025-01-31T18:00:00 \
+    --src-repo rwe/era5-0p25-6h-nonprod-ohio \
+    --src-branch main \
+    --dst-store s3://kafou-data/tutorial-channel.zarr \
+    --token "$ARRAYLAKE_TOKEN" \
+    --times-at-once 120 \
+    --cpus 4
 """
 
 import datetime
 import logging
-import os
-import pickle
 import re
 import secrets
 import subprocess
@@ -34,6 +43,7 @@ import numpy as np
 import xarray as xr
 import zarr
 from dataset_io import ensure_time_in_arrays
+from obstore_utils import create_bucket_if_not_exists, open_s3_zarr_store
 from zarr.core.config import config as zarr_config
 
 logging.basicConfig(
@@ -341,47 +351,6 @@ def get_batches(
     return batches
 
 
-def get_or_create_repo_branch(
-    *,
-    client: arraylake.Client,
-    repo_name: str,
-    branch_name: str,
-    base_branch: str = "main",
-) -> tuple["arraylake.Repo", "arraylake.Session"]:
-    """Open an Arraylake repo and branch, creating them if they do not exist."""
-    try:
-        repo = client.get_repo(repo_name, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
-        logger.info(f"  Opened existing repo: {repo_name}")
-    except Exception:
-        repo = client.create_repo(repo_name, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
-        logger.info(f"  Created new repo: {repo_name}")
-
-    branches = repo.list_branches()
-    if branch_name not in branches:
-        logger.info(f"  Branch '{branch_name}' does not exist, creating from '{base_branch}'")
-        base_commit = repo.lookup_branch(base_branch)
-        repo.create_branch(branch_name, base_commit)
-    else:
-        logger.info(f"  Branch '{branch_name}' already exists")
-
-    session = repo.writable_session(branch_name)
-    return repo, session
-
-
-def commit_with_retries(
-    session: "arraylake.Session",
-    msg: str,
-    max_attempts: int = 6,
-) -> str:
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return session.commit(msg)
-        except (RuntimeError, icechunk.IcechunkError):
-            if attempt == max_attempts:
-                raise
-            time.sleep(2**attempt)
-
-
 def get_job_count(job_prefix: str) -> int:
     """Count remaining SLURM jobs whose name starts with job_prefix."""
     res = subprocess.run(
@@ -395,12 +364,12 @@ def get_job_count(job_prefix: str) -> int:
 
 def set_metadata(
     *,
-    session: "arraylake.Session",
+    store: zarr.abc.store.Store,
     start_time: datetime.datetime | None = None,
     end_time: datetime.datetime | None = None,
     extra: dict | None = None,
 ) -> None:
-    root = zarr.open_group(session.store, path="samples", zarr_format=3)
+    root = zarr.open_group(store, path="samples", zarr_format=3)
     attrs = dict(root.attrs)
 
     attrs["last_updated"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -409,6 +378,30 @@ def set_metadata(
         attrs.update(extra)
 
     root.attrs.put(attrs)
+
+
+def batch_marker_path(dst_store: str, start: datetime.datetime, end: datetime.datetime) -> str:
+    """S3 path of the marker for a single sbatch submission.
+
+    Lives alongside (not inside) the zarr store so marker listing never has
+    to walk zarr chunk keys. Filename encodes the batch's start/end range.
+    """
+    stem = f"{start:%Y%m%dT%H%M%S}_{end:%Y%m%dT%H%M%S}"
+    return f"{dst_store.rstrip('/')}__markers/{stem}.done"
+
+
+def write_batch_marker(*, dst_store: str, start: datetime.datetime, end: datetime.datetime) -> str:
+    fs = s3_filesystem()
+    path = batch_marker_path(dst_store, start, end)
+    with fs.open(path, "wb") as fobj:
+        fobj.write(b"")
+    return path
+
+
+def batch_marker_exists(
+    *, dst_store: str, start: datetime.datetime, end: datetime.datetime
+) -> bool:
+    return s3_filesystem().exists(batch_marker_path(dst_store, start, end))
 
 
 # ----#
@@ -426,48 +419,33 @@ def cli():
 @click.argument("end_time", type=click.DateTime())
 @click.option("--src-repo", required=True)
 @click.option("--src-branch", default="main")
-@click.option("--dst-repo", required=True)
-@click.option("--dst-branch", default="main")
-@click.option("--fork-pickle", required=False, default=None)
+@click.option("--dst-store", required=True, help="S3 URL of destination zarr v3 store")
 @click.option("--token", default=None)
 def channelize_worker(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
     src_repo: str,
     src_branch: str,
-    dst_repo: str,
-    dst_branch: str,
-    fork_pickle: str | None,
+    dst_store: str,
     token: str | None,
 ) -> None:
     logger.info(f"\n{'=' * 80}")
     logger.info(f"[BATCH] {start_time:%Y-%m-%d} -> {end_time:%Y-%m-%d}")
     logger.info("=" * 80)
 
-    # -- Session --
-    logger.info("[SESSION] initializing")
-
+    # -- Arraylake auth (for source only) --
     client = arraylake_client(token)
     if token is None and src_repo.startswith("rwe/"):
-        logger.info("  logging in to Arraylake")
+        logger.info("[AUTH] logging in to Arraylake")
         client.login()
 
-    fs = s3_filesystem()
+    # -- Destination store (plain zarr v3 over obstore, no sessions) --
+    logger.info(f"[DEST] opening zarr store at {dst_store}")
+    dst_zstore = open_s3_zarr_store(dst_store, profile=S3_PROFILE)
 
-    if fork_pickle is not None:
-        logger.info(f"  loading fork session from {fork_pickle}")
-        with fs.open(fork_pickle, "rb") as fobj:
-            dst_session = pickle.load(fobj)
-    else:
-        logger.info(f"  opening writable session on {dst_repo}/{dst_branch}")
-        repo = client.get_repo(dst_repo, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
-        dst_session = repo.writable_session(dst_branch)
-
-    # -- Destination store --
     logger.info("[DEST] reading destination timestamps")
-
     ds_store = xr.open_zarr(
-        dst_session.store,
+        dst_zstore,
         zarr_format=3,
         consolidated=False,
         group="samples",
@@ -540,27 +518,18 @@ def channelize_worker(
     )
     logger.info(f"  estimated GETs: sfc={sfc_gets:,} pl={pl_gets:,} total={sfc_gets + pl_gets:,}")
 
-    def _load(args: tuple) -> tuple[str, np.ndarray]:
-        grp, v, sl, ts, te = args
-        return v, grp[v][sl][ts:te]
+    def _load(grp: zarr.Group, var: str) -> np.ndarray:
+        return grp[var][t_slice_aligned][trim_start:trim_end]
 
-    # 9 workers — one per variable (4 sfc + 5 pl).
-    # zarr releases the GIL on IO so threads genuinely overlap.
-    # Each worker fetches the chunk-aligned slice then trims to the exact window.
-    with ThreadPoolExecutor(max_workers=9) as ex:
-        sfc_data = dict(
-            ex.map(
-                _load,
-                [(sfc_grp, v, t_slice_aligned, trim_start, trim_end) for v in NAME_MAP["sfc"]],
-            )
-        )
-        pl_data = dict(
-            ex.map(
-                _load,
-                [(pl_grp, v, t_slice_aligned, trim_start, trim_end) for v in NAME_MAP["pl"]],
-            )
-        )
-        time_vals = time_ns[start_idx:end_idx]
+    sfc_vars = list(NAME_MAP["sfc"])
+    pl_vars = list(NAME_MAP["pl"])
+    with ThreadPoolExecutor(max_workers=len(sfc_vars) + len(pl_vars)) as executor:
+        sfc_futures = {v: executor.submit(_load, sfc_grp, v) for v in sfc_vars}
+        pl_futures = {v: executor.submit(_load, pl_grp, v) for v in pl_vars}
+        sfc_data = {v: f.result() for v, f in sfc_futures.items()}
+        pl_data = {v: f.result() for v, f in pl_futures.items()}
+
+    time_vals = time_ns[start_idx:end_idx]
 
     lat_vals = sfc_grp["latitude"][:]
     lon_vals = sfc_grp["longitude"][:]
@@ -609,7 +578,7 @@ def channelize_worker(
     )
 
     write_ds.to_zarr(
-        dst_session.store,
+        dst_zstore,
         group="samples",
         region="auto",
         mode="r+",
@@ -618,18 +587,9 @@ def channelize_worker(
 
     logger.info("  write complete")
 
-    # -- Finalize --
-    logger.info("[SESSION] finalizing")
-
-    if fork_pickle is None:
-        commit_id = dst_session.commit(f"Added {timestamps.min()} to {timestamps.max()}")
-        logger.info(f"  committed: {commit_id}")
-    else:
-        time_str = f"{start_time:%Y%m%d_%H%M%S}_{end_time:%Y%m%d_%H%M%S}"
-        out_pickle = fork_pickle.replace(".pickle", f".{time_str}.worker.pickle")
-        logger.info(f"  writing worker pickle: {out_pickle}")
-        with fs.open(out_pickle, "wb") as fobj:
-            pickle.dump(dst_session, fobj)
+    # Written last so its presence certifies all chunks for this batch landed.
+    marker = write_batch_marker(dst_store=dst_store, start=start_time, end=end_time)
+    logger.info(f"[MARKER] batch marker written: {marker}")
 
     logger.info(f"[DONE] {start_time.isoformat()} -> {end_time.isoformat()}")
 
@@ -639,25 +599,27 @@ def channelize_worker(
 @click.argument("end_time", type=click.DateTime())
 @click.option("--src-repo", required=True)
 @click.option("--src-branch", default="main")
-@click.option("--dst-repo", required=True)
-@click.option("--dst-branch", default="main")
+@click.option("--dst-store", required=True, help="S3 URL of destination zarr v3 store")
 @click.option("--token", default=None)
 @click.option("--times-at-once", type=int, default=56)
-@click.option("--coordination-location", required=True)
 @click.option("--cpus", type=int, default=16)
 def submit_jobs(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
     src_repo: str,
     src_branch: str,
-    dst_repo: str,
-    dst_branch: str,
+    dst_store: str,
     token: str | None,
     times_at_once: int,
-    coordination_location: str,
     cpus: int,
 ) -> None:
-    """Distributed channelization using SLURM + Icechunk sessions."""
+    """Distributed channelization against a plain zarr v3 store.
+
+    Each SLURM worker writes a disjoint, chunk-aligned time slice via
+    region="auto", then writes a per-batch done marker. The coordinator
+    extends the time axis once up front (single-writer), submits sbatch
+    jobs, waits for the queue to drain, and updates store metadata.
+    """
 
     logger.info(f"\n{'=' * 80}")
     logger.info(f"[SUBMIT] {start_time:%Y-%m-%d %H:%M} -> {end_time:%Y-%m-%d %H:%M}")
@@ -667,33 +629,24 @@ def submit_jobs(
     logger.info("[SETUP] initializing")
 
     client = arraylake_client(token)
-    if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
+    if token is None and src_repo.startswith("rwe/"):
         client.login()
 
-    repo = client.get_repo(dst_repo, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
+    # -- Extend time axis (single-writer, before any worker starts) --
+    logger.info(f"[DEST] opening zarr store at {dst_store}")
+    dst_zstore = open_s3_zarr_store(dst_store, profile=S3_PROFILE)
 
-    # -- Extend time axis --
     logger.info(f"[DEST] ensuring time axis through {end_time}")
-
-    base_session = repo.writable_session(dst_branch)
     msg = ensure_time_in_arrays(
-        store=base_session.store,
+        store=dst_zstore,
         timestamp=end_time,
         time_frequency="6h",
         group="samples",
     )
-
     if msg is not None:
-        logger.info(f"  extending: {msg}")
-        commit_with_retries(session=base_session, msg=str(msg))
+        logger.info(f"  extended: {msg}")
     else:
         logger.info("  time axis already sufficient")
-
-    # -- Fork --
-    logger.info("[SESSION] creating base fork")
-
-    base_session = repo.writable_session(dst_branch)
-    fork = base_session.fork()
 
     # -- Batch planning --
     batches = get_batches(start_time, end_time, times_at_once)
@@ -703,25 +656,26 @@ def submit_jobs(
         logger.info(f"  first: {batches[0][0]} -> {batches[0][-1]}")
         logger.info(f"  last:  {batches[-1][0]} -> {batches[-1][-1]}")
 
-    # -- Save fork pickle --
-    job_id = random_job_string(10)
-    session_location = os.path.join(coordination_location, job_id)
-    fork_pickle = os.path.join(session_location, "fork.pickle")
-
-    logger.info(f"[SESSION] saving fork pickle (job_id={job_id})")
-
-    fs = s3_filesystem()
-    with fs.open(fork_pickle, "wb") as fobj:
-        pickle.dump(fork, fobj)
+    # SLURM job-name prefix used only to group + wait on this run's workers.
+    # Random so concurrent submit-jobs calls do not wait on each other.
+    job_prefix = f"chan_{random_job_string(10)}"
 
     # -- Submit SLURM jobs --
-    logger.info(f"[SLURM] submitting {len(batches)} jobs (cpus={cpus})")
+    # Existing batch markers are skipped so re-running the same submit-jobs
+    # command after a partial failure only resubmits the batches that did
+    # not complete last time.
+    logger.info(f"[SLURM] submitting up to {len(batches)} jobs (cpus={cpus})")
 
-    job_prefix = f"chan_{job_id}"
-
+    submitted = 0
+    skipped = 0
     for i, batch in enumerate(batches, start=1):
         batch_start, batch_end = batch[0], batch[-1]
         start_s, end_s = batch_start.isoformat(), batch_end.isoformat()
+
+        if batch_marker_exists(dst_store=dst_store, start=batch_start, end=batch_end):
+            logger.info(f"  [{i}/{len(batches)}] {start_s} -> {end_s} — SKIP (marker exists)")
+            skipped += 1
+            continue
 
         logger.info(f"  [{i}/{len(batches)}] {start_s} -> {end_s}")
 
@@ -737,21 +691,20 @@ def submit_jobs(
             end_s,
             f"--src-repo={src_repo}",
             f"--src-branch={src_branch}",
-            f"--dst-repo={dst_repo}",
-            f"--dst-branch={dst_branch}",
-            f"--fork-pickle={fork_pickle}",
+            f"--dst-store={dst_store}",
             *([] if token is None else [f"--token={token}"]),
         ]
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"sbatch failed:\n{res.stderr}")
+        submitted += 1
 
         # Stagger submissions to spread manifest fetches across time and
         # avoid thundering-herd on S3 from all workers starting simultaneously.
         time.sleep(10)
 
-    logger.info("  all jobs submitted")
+    logger.info(f"  submitted={submitted} skipped={skipped}")
 
     # -- Wait --
     logger.info("[SLURM] waiting for workers")
@@ -763,31 +716,13 @@ def submit_jobs(
 
     logger.info("  all jobs complete")
 
-    # -- Merge --
-    logger.info("[MERGE] collecting worker sessions")
+    # -- Metadata --
+    # Workers write a per-batch marker as the last step of a successful run.
+    # Missing markers after SLURM is empty indicate crashed/failed batches —
+    # inspect the markers prefix alongside dst-store to determine what to re-run.
+    logger.info("[META] updating store metadata")
+    set_metadata(store=dst_zstore, start_time=start_time, end_time=end_time)
 
-    time.sleep(10)
-
-    worker_forks = []
-    for fspath in fs.ls(session_location):
-        if fspath.endswith(".worker.pickle"):
-            logger.info(f"  loading {fspath}")
-            with fs.open(fspath, "rb") as fobj:
-                worker_forks.append(pickle.load(fobj))
-        fs.rm(fspath)
-
-    logger.info(f"  merging {len(worker_forks)} forks")
-    base_session.merge(*worker_forks)
-
-    # -- Commit --
-    logger.info("[COMMIT] setting metadata")
-
-    set_metadata(session=base_session, start_time=start_time, end_time=end_time)
-
-    commit_msg = f"channelize {start_time.isoformat()} -> {end_time.isoformat()}"
-    commit_id = commit_with_retries(session=base_session, msg=commit_msg)
-
-    logger.info(f"  committed: {commit_id}")
     logger.info("[SUBMIT DONE]")
 
 
@@ -795,9 +730,8 @@ def submit_jobs(
 @click.option("--start-time", type=click.DateTime(), default=None)
 @click.option("--end-time", type=click.DateTime(), default=None)
 @click.option("--src-repo", default="rwe/era5-0p25-6h-nonprod-ohio")
-@click.option("--dst-repo", default="kafou/aurora-era5-samples")
 @click.option("--src-branch", default="main")
-@click.option("--dst-branch", default="main")
+@click.option("--dst-store", required=True, help="S3 URL of destination zarr v3 store")
 @click.option("--token", default=None)
 @click.option(
     "--force-init",
@@ -809,14 +743,13 @@ def init(
     end_time: datetime.datetime | None,
     src_repo: str,
     src_branch: str,
-    dst_repo: str,
-    dst_branch: str,
-    token: str,
+    dst_store: str,
+    token: str | None,
     force_init: bool = False,
 ) -> None:
-    """Initialize channelized repository."""
+    """Initialize a plain zarr v3 destination store with the channelized schema."""
     client = arraylake_client(token)
-    if token is None and (src_repo.startswith("rwe/") or dst_repo.startswith("rwe/")):
+    if token is None and src_repo.startswith("rwe/"):
         client.login()
 
     sfc_ds, pl_ds, inv_ds, _ = open_src_datasets(
@@ -825,13 +758,12 @@ def init(
         token=token,
     )
 
-    _, session = get_or_create_repo_branch(
-        client=client,
-        repo_name=dst_repo,
-        branch_name=dst_branch,
-        base_branch="main",
-    )
-    root = zarr.open_group(session.store, mode="a")
+    bucket = dst_store.removeprefix("s3://").split("/", 1)[0]
+    create_bucket_if_not_exists(bucket, profile=S3_PROFILE)
+
+    logger.info(f"[DEST] opening zarr store at {dst_store}")
+    dst_zstore = open_s3_zarr_store(dst_store, profile=S3_PROFILE)
+    root = zarr.open_group(dst_zstore, mode="a")
 
     if force_init:
         logger.info("  --force-init: deleting existing schema")
@@ -845,7 +777,7 @@ def init(
         )
 
     init_store(
-        session.store,
+        dst_zstore,
         sfc_ds=sfc_ds,
         pl_ds=pl_ds,
         inv_ds=inv_ds,
@@ -853,13 +785,11 @@ def init(
         end_time=end_time,
     )
 
-    set_metadata(session=session, start_time=None, end_time=None)
-
-    commit_id = commit_with_retries(session=session, msg="Initialized sample data store.")
-    logger.info(f"  initialized: commit_id={commit_id}")
+    set_metadata(store=dst_zstore, start_time=None, end_time=None)
+    logger.info("[INIT] done")
 
     ds = xr.open_zarr(
-        session.store,
+        dst_zstore,
         zarr_format=3,
         consolidated=False,
         group="samples",

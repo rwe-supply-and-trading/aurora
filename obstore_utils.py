@@ -3,11 +3,47 @@
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 from obstore.auth.boto3 import Boto3CredentialProvider
 from obstore.store import S3Store
 from zarr.storage import ObjectStore
 
 LOGGER = logging.getLogger(__name__)
+
+
+def create_bucket_if_not_exists(
+    bucket: str, *, profile: str | None = None, region: str | None = None
+) -> None:
+    """Create an S3 bucket if it does not already exist.
+
+    Args:
+        bucket: The name of the bucket.
+        profile: (Optional) An AWS profile name.
+        region: (Optional) Region in which to create the bucket. Defaults to the
+            session's configured region, or ``us-east-1`` if none is set.
+    """
+    session_extra_args = {}
+    if profile is not None:
+        session_extra_args["profile_name"] = profile
+    session = boto3.Session(**session_extra_args)
+    s3 = session.client("s3")
+
+    try:
+        s3.head_bucket(Bucket=bucket)
+        LOGGER.info("Bucket %s already exists", bucket)
+        return
+    except ClientError as err:
+        code = err.response.get("Error", {}).get("Code")
+        if code not in {"404", "NoSuchBucket"}:
+            raise
+
+    region = region or session.region_name or "us-east-1"
+    create_kwargs: dict = {"Bucket": bucket}
+    if region != "us-east-1":
+        create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+
+    s3.create_bucket(**create_kwargs)
+    LOGGER.info("Created bucket %s in %s", bucket, region)
 
 
 def open_s3_zarr_store(
