@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 xr.set_options(keep_attrs=True)
 
-zarr_config.set({"async.concurrency": 16})
+zarr_config.set({"async.concurrency": 4})
 
 # Repo-level config: concurrency tuning for icechunk storage backend.
 # Passed as `config=` to client.get_repo().
@@ -63,7 +63,7 @@ REPO_CONFIG = icechunk.RepositoryConfig.default()
 
 # Storage-level config: network timeout tuning.
 # minimum_throughput_bytes_per_second=0 disables the throughput floor check.
-STORAGE_OPTIONS: dict = {"network_stream_timeout_seconds": 600}
+# STORAGE_OPTIONS: dict = {"network_stream_timeout_seconds": 600}
 
 INVARIANT_REPO = "rwe/era5-0p25-6h-nonprod-ohio"
 S3_PROFILE = "kafou"
@@ -102,7 +102,7 @@ def open_src_session(
     ambiguity that session_only=True caused.
     """
     client = arraylake_client(token)
-    src_repo_obj = client.get_repo(src_repo, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
+    src_repo_obj = client.get_repo(src_repo, config=REPO_CONFIG)
     return src_repo_obj.readonly_session(src_branch)
 
 
@@ -123,7 +123,7 @@ def open_src_datasets(
     else:
         raise ValueError(f"Source repo must contain 'era5' or 'ecmwf': {src_repo}")
 
-    src_repo_obj = client.get_repo(src_repo, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS)
+    src_repo_obj = client.get_repo(src_repo, config=REPO_CONFIG)
     src_session = src_repo_obj.readonly_session(src_branch)
 
     if dataset_type == "ecmwf":
@@ -166,9 +166,7 @@ def open_src_datasets(
         pl_ds = pl_ds.sortby("level")
 
     # Invariant is always from ERA5
-    inv_repo_obj = client.get_repo(
-        INVARIANT_REPO, config=REPO_CONFIG, storage_options=STORAGE_OPTIONS
-    )
+    inv_repo_obj = client.get_repo(INVARIANT_REPO, config=REPO_CONFIG)
     inv_session = inv_repo_obj.readonly_session("main")
     inv_ds = xr.open_zarr(
         inv_session.store,
