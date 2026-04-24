@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 xr.set_options(keep_attrs=True)
 
-zarr_config.set({"async.concurrency": 4})
+zarr_config.set({"async.concurrency": 8})
 
 # Repo-level config: concurrency tuning for icechunk storage backend.
 # Passed as `config=` to client.get_repo().
@@ -681,7 +681,7 @@ def submit_jobs(
             "sbatch",
             "--ntasks=1",
             f"--cpus-per-task={cpus}",
-            "--mem=50G",
+            "--mem=220G",
             f"--job-name={job_prefix}_{start_s}_{end_s}",
             sys.argv[0],
             "channelize-worker",
