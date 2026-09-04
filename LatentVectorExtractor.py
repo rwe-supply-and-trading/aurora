@@ -205,14 +205,14 @@ class LatentVectorExtractor:
 
         with torch.inference_mode():
             for step, preds in enumerate(rollout(self.model, batch, steps)):
-                preds = batch_to_tensor(preds)  # (B, T, H, W, F)
-                preds = preds[:, -1]  # (B, H, W, F)
+                pred_tensor = batch_to_tensor(preds)  # (B, T, H, W, F)
+                pred_tensor = pred_tensor[:, -1]  # (B, H, W, F)
 
-                preds = preds.squeeze(0)  # (H, W, F)
+                pred_tensor = pred_tensor.squeeze(0)  # (H, W, F)
 
-                print(f"[LVE.rollout] step={step} shape={preds.shape}")
+                print(f"[LVE.rollout] step={step} shape={pred_tensor.shape}")
 
-                lvs.append(preds.cpu())
+                lvs.append(pred_tensor.cpu())
 
         lv_arr = torch.stack(lvs).numpy().astype("float32", copy=False)
 

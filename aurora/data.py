@@ -71,7 +71,7 @@ class ERA5DataLoaderFOAM:
         self.meta_lon = torch.from_numpy(sample_ds.longitude.to_numpy())
         self.meta_atmos_levels = tuple(x.item() for x in sample_ds.atmos_levels)
 
-    def __getitem__(self, timestamp: datetime.datetime | int) -> Batch | tuple[Batch, Batch]:
+    def __getitem__(self, timestamp: datetime.datetime | int) -> Batch:
         if isinstance(timestamp, datetime.datetime):
             if (
                 timestamp.hour not in (0, 6, 12, 18)
@@ -90,7 +90,7 @@ class ERA5DataLoaderFOAM:
                 raise KeyError(f"Invalid index: {timestamp}")
             ds = self.sample_ds.isel(time=slice(timestamp, timestamp + 2))
             timestamp = datetime.datetime.fromtimestamp(
-                ds.time[1].item() / 1_000_000_000, tz=datetime.UTC
+                ds.time[1].item() / 1_000_000_000, tz=datetime.timezone.utc
             ).replace(tzinfo=None)
         else:
             raise KeyError(f"Invalid key: {timestamp!r}")
@@ -269,7 +269,7 @@ class ECMWFDataLoaderFOAM:
         self.meta_lon = torch.from_numpy(sample_ds.longitude.to_numpy())
         self.meta_atmos_levels = tuple(x.item() for x in sample_ds.atmos_levels)
 
-    def __getitem__(self, timestamp: datetime.datetime | int) -> Batch | tuple[Batch, Batch]:
+    def __getitem__(self, timestamp: datetime.datetime | int) -> Batch:
         if isinstance(timestamp, datetime.datetime):
             if (
                 timestamp.hour not in (0, 6, 12, 18)
@@ -288,7 +288,7 @@ class ECMWFDataLoaderFOAM:
                 raise KeyError(f"Invalid index: {timestamp}")
             ds = self.sample_ds.isel(time=slice(timestamp, timestamp + 2))
             timestamp = datetime.datetime.fromtimestamp(
-                ds.time[1].item() / 1_000_000_000, tz=datetime.UTC
+                ds.time[1].item() / 1_000_000_000, tz=datetime.timezone.utc
             ).replace(tzinfo=None)
         else:
             raise KeyError(f"Invalid key: {timestamp!r}")

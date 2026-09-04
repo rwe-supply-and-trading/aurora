@@ -114,7 +114,7 @@ def ensure_time_in_arrays(
         logger.info(
             f"Requested time {timestamp} already exists in output dataset.Not adding new times."
         )
-        return
+        return None
 
     # If the time is before the first time or less than the last time, raise
     # an error.  Use pd.to_datetime to ensure we're comparing the same time types.
@@ -172,8 +172,8 @@ def ensure_time_in_arrays(
     # We need to encode these to CF integers following the conventions
     # in the Zarr dataset.  Xarray can obscure the needed attributes
     # when decoding the times, so switch to using zarr here
-    group = zarr.open_group(store=store, path=group)
-    time_coord_array = group[time_dim]
+    zarr_group = zarr.open_group(store=store, path=group)
+    time_coord_array = zarr_group[time_dim]
     time_coord_attrs = dict(time_coord_array.attrs)
 
     # Build the actual encoded time values here
@@ -195,7 +195,7 @@ def ensure_time_in_arrays(
     # since we don't have actual data to append, just want to fill with NaN.
     for var, dim_index in variables_to_adjust:
         # Get this array and its shape
-        zarr_array = group[var]
+        zarr_array = zarr_group[var]
         current_shape = list(zarr_array.shape)
         # Add the number of new times to the appropriate dimension
         current_shape[dim_index] += num_new_times

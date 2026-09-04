@@ -184,8 +184,8 @@ def get_variable_locations(n_pressure_levels: int = 13) -> tuple[dict, dict]:
 
     Each maps {"sfc": {var: (start_idx, n_channels)}, "pl": {...}}.
     """
-    in_locs = {"sfc": {}, "pl": {}}
-    out_locs = {"sfc": {}, "pl": {}}
+    in_locs: dict[str, dict[str, tuple[int, int]]] = {"sfc": {}, "pl": {}}
+    out_locs: dict[str, dict[str, tuple[int, int]]] = {"sfc": {}, "pl": {}}
 
     i = 0
     for src_name, dst_name in NAME_MAP["sfc"].items():
@@ -370,7 +370,9 @@ def set_metadata(
     root = zarr.open_group(store, path="samples", zarr_format=3)
     attrs = dict(root.attrs)
 
-    attrs["last_updated"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    attrs["last_updated"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
 
     if extra:
         attrs.update(extra)

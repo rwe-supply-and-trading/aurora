@@ -4,6 +4,7 @@ Utilities for working with Zarr data using the obstore backend.
 """
 
 import logging
+from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
@@ -25,7 +26,7 @@ def create_bucket_if_not_exists(
         region: (Optional) Region in which to create the bucket. Defaults to the
             session's configured region, or ``us-east-1`` if none is set.
     """
-    session_extra_args = {}
+    session_extra_args: dict[str, Any] = {}
     if profile is not None:
         session_extra_args["profile_name"] = profile
     session = boto3.Session(**session_extra_args)
@@ -65,6 +66,7 @@ def open_s3_zarr_store(
     if location.startswith("s3://"):
         location = location[5:]
 
+    prefix: str | None
     if "/" in location:
         bucket, prefix = location.split("/", 1)
         if not prefix:
@@ -74,7 +76,7 @@ def open_s3_zarr_store(
     else:
         bucket, prefix = location, None
 
-    session_extra_args = {}
+    session_extra_args: dict[str, Any] = {}
     if profile is not None:
         session_extra_args["profile_name"] = profile
 
@@ -86,7 +88,7 @@ def open_s3_zarr_store(
     region = s3.get_bucket_location(Bucket=bucket)["LocationConstraint"]
     session = boto3.Session(**session_extra_args, region_name=region)
 
-    s3store_extra_args = {}
+    s3store_extra_args: dict[str, Any] = {}
     if profile == "kafou":
         s3store_extra_args["endpoint_url"] = "http://kafou-storage.ai-lab.energy.local/"
         s3store_extra_args["virtual_hosted_style_request"] = False

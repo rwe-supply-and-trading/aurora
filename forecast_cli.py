@@ -5,9 +5,11 @@ import logging
 import os
 import subprocess
 import sys
+from types import ModuleType
 
 import click
 import numpy as np
+import pandas as pd
 import xarray as xr
 import zarr
 from dataset_io import ensure_time_in_arrays
@@ -29,7 +31,7 @@ for var in [
     os.environ.pop(var, None)
 
 
-def _get_module(mode: str) -> object:
+def _get_module(mode: str) -> ModuleType:
     """Helper to import the correct module based on mode.
     Args:
         - mode: Forecast mode ("latent" or "raw")
@@ -84,13 +86,13 @@ def submit_jobs(*, start_time: str, end_time: str, store_path: str, src: str, mo
     if "source" not in root.attrs:
         root.attrs["source"] = src
     else:
-        assert root.attrs["source"] == src, (
-            f"Store source={root.attrs['source']!r} != worker src={src!r}"
-        )
+        assert (
+            root.attrs["source"] == src
+        ), f"Store source={root.attrs['source']!r} != worker src={src!r}"
 
     ensure_time_in_arrays(
         store=store,
-        timestamp=end_time,
+        timestamp=pd.to_datetime(end_time).to_pydatetime(),
         time_dim="init_time",
         time_frequency="6h",
     )

@@ -4,7 +4,7 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from typing import Optional
+from typing import Literal, Optional, overload
 
 import numpy as np
 import torch
@@ -261,7 +261,15 @@ class Aurora(torch.nn.Module):
             # We run the backbone in pure BF16.
             self.backbone.to(torch.bfloat16)
 
-    def forward(self, batch: Batch, return_latent: bool = False) -> Batch | torch.Tensor:
+    @overload
+    def forward(self, batch: Batch, return_latent: Literal[False] = False) -> Batch: ...
+
+    @overload
+    def forward(self, batch: Batch, return_latent: Literal[True]) -> tuple[Batch, torch.Tensor]: ...
+
+    def forward(
+        self, batch: Batch, return_latent: bool = False
+    ) -> Batch | tuple[Batch, torch.Tensor]:
         """Forward pass.
 
         Args:
