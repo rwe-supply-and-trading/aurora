@@ -236,6 +236,7 @@ class ECMWFDataLoaderFOAM:
         import kafou_arraylake as arraylake
 
         from aurora import AuroraPretrained
+        from aurora.latent import capture_latents
 
         # Get an icechunk session.
         client = arraylake.Client()
@@ -263,9 +264,11 @@ class ECMWFDataLoaderFOAM:
         model.to("cuda")
 
         # Iterate over batches, getting latent vectors.
-        for batch in loader:
-            pred = model.forward(batch, return_latent=True)
-            ...
+        with capture_latents(model) as capture:
+            for batch in loader:
+                pred = model.forward(batch)
+                latent = capture.latent
+                ...
     """
 
     def __init__(

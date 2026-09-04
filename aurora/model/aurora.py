@@ -4,7 +4,7 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from typing import Literal, Optional, overload
+from typing import Optional
 
 import numpy as np
 import torch
@@ -15,15 +15,19 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from aurora.batch import Batch
+from aurora.insolation import insolation
 from aurora.model.compat import (
     _adapt_checkpoint_air_pollution,
     _adapt_checkpoint_pretrained,
+    _adapt_checkpoint_v1p5,
     _adapt_checkpoint_wave,
 )
 from aurora.model.decoder import Perceiver3DDecoder
 from aurora.model.encoder import Perceiver3DEncoder
 from aurora.model.lora import LoRAMode
-from aurora.model.swin3d import Swin3DTransformerBackbone
+from aurora.model.perceiver import PerceiverAttention
+from aurora.model.swin3d import Swin3DTransformerBackbone, WindowAttention
+from aurora.normalisation import log_transform, log_untransform
 
 __all__ = [
     "Aurora",
@@ -34,6 +38,8 @@ __all__ = [
     "AuroraHighRes",
     "AuroraAirPollution",
     "AuroraWave",
+    "AuroraV1p5",
+    "AuroraV1p5Ensemble",
 ]
 
 
@@ -41,6 +47,8 @@ class Aurora(torch.nn.Module):
     """The Aurora model.
 
     Defaults to the 1.3 B parameter configuration.
+
+    Also supports ensemble forecasts.
     """
 
     default_checkpoint_repo = "microsoft/aurora"
@@ -48,6 +56,9 @@ class Aurora(torch.nn.Module):
 
     default_checkpoint_name = "aurora-0.25-finetuned.ckpt"
     """str: Name of the default checkpoint."""
+
+    default_checkpoint_revision = "0be7e57c685dac86b78c4a19a3ab149d13c6a3dd"
+    """str: Commit hash of the default checkpoint."""
 
     def __init__(
         self,
@@ -80,16 +91,24 @@ class Aurora(torch.nn.Module):
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         normalise: bool = True,
         autocast: bool = False,
+        autocast_dtype: torch.dtype = torch.bfloat16,
         bf16_mode: bool = False,
+        use_fp16_safe_attention: bool = False,
         level_condition: Optional[tuple[int | float, ...]] = None,
         dynamic_vars: bool = False,
         atmos_static_vars: bool = False,
         separate_perceiver: tuple[str, ...] = (),
-        modulation_head: bool = False,
+        modulation_heads: tuple[str, ...] = (),
         positive_surf_vars: tuple[str, ...] = (),
         positive_atmos_vars: tuple[str, ...] = (),
         clamp_at_first_step: bool = False,
         simulate_indexing_bug: bool = False,
+        stochastic: bool = False,
+        use_updated_lead_time_embedding: bool = False,
+        variable_lead_time: bool = False,
+        rollout_input_clipping: Optional[dict[str, dict[str, Optional[float]]]] = None,
+        output_only_surf_vars: tuple[str, ...] = (),
+        output_only_atmos_vars: tuple[str, ...] = (),
     ) -> None:
         """Construct an instance of the model.
 
@@ -122,7 +141,7 @@ class Aurora(torch.nn.Module):
             drop_rate (float, optional): Drop-out rate.
             drop_path (float, optional): Drop-path rate.
             enc_depth (int, optional): Number of Perceiver blocks in the encoder.
-            dec_depth (int, optioanl): Number of Perceiver blocks in the decoder.
+            dec_depth (int, optional): Number of Perceiver blocks in the decoder.
             dec_mlp_ratio (float, optional): Hidden dim. to embedding dim. ratio for MLPs in the
                 decoder. The embedding dimensionality here is different, which is why this is a
                 separate parameter.
@@ -143,10 +162,18 @@ class Aurora(torch.nn.Module):
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
-            bf16_mode (bool, optional): To reduce memory usage, convert the tokens to BF16, run
-                the backbone in pure BF16, and run the decoder in FP16 AMP. This should enable a
-                gradient computation. USE AT YOUR OWN RISK. THIS WAS NOT USED DURING THE DEVELOPMENT
-                OF AURORA AND IS PURELY PROVIDED AS A STARTING POINT FOR FINE-TUNING.
+            normalise (bool, optional): Normalise the input batch and un-normalise the prediction
+                inside the model. Set to `False` if you are normalising the data yourself outside
+                of the model. Defaults to `True`.
+            autocast (bool, optional): To reduce memory usage, `torch.autocast` only the backbone
+                to a lower-precision dtype. This is critical to enable fine-tuning.
+            autocast_dtype (torch.dtype, optional): Data type to use when `autocast` is enabled.
+                Defaults to `torch.bfloat16`.
+            use_fp16_safe_attention (bool, optional): Replace
+                :func:`torch.nn.functional.scaled_dot_product_attention` with a manual
+                implementation that clamps intermediate values to prevent float16 overflow.
+                Recommended when running with `autocast_dtype=torch.float16`.
+                Defaults to `False`.
             level_condition (tuple[int | float, ...], optional): Make the patch embeddings dependent
                 on pressure level. If you want to enable this feature, provide a tuple of all
                 possible pressure levels.
@@ -159,8 +186,9 @@ class Aurora(torch.nn.Module):
                 with variables that have a significantly different behaviour. If you want to enable
                 this features, set this to the collection of variables that should be run on a
                 separate Perceiver.
-            modulation_head (bool, optional): Enable an additional head, the so-called modulation
-                head, that can be used to predict the difference. Defaults to `False`.
+            modulation_heads (tuple[str, ...], optional): Names of every variable for which to
+                enable an additional head, the so-called modulation head, that can be used to
+                predict the difference.
             positive_surf_vars (tuple[str, ...], optional): Mark these surface-level variables as
                 positive. Clamp them before running them through the encoder, and also clamp them
                 when autoregressively rolling out the model. The variables are not clamped for the
@@ -174,9 +202,30 @@ class Aurora(torch.nn.Module):
             simulate_indexing_bug (bool, optional): Simulate an indexing bug that's present for the
                 air pollution version of Aurora. This is necessary to obtain numerical equivalence
                 to the original implementation. Defaults to `False`.
+            stochastic (bool, optional): If `True`, enable stochastic mode with noise injection.
+                Defaults to `False`.
+            use_updated_lead_time_embedding (bool, optional): Whether to use the updated lead time
+                embedding with a minimum wavelength of 2 hours. Defaults to `False`.
+            variable_lead_time (bool, optional): If `True`, use per-sample lead times passed
+                via the `lead_times` argument to `forward` (a tensor of shape `(batch,)` in
+                hours) instead of the fixed `timestep`. When enabled, `lead_times` must be
+                provided.
+                Defaults to `False`.
+            rollout_input_clipping (dict[str, dict[str, float]], optional): Per-variable
+                clipping bounds applied to predictions during autoregressive rollout before they
+                become the next input. Keys are variable names (must match `surf_vars` or
+                `atmos_vars`). Values are dicts with optional `"min"` and `"max"` keys.
+                Example: `{"tcc": {"min": 0, "max": 1}}`. Defaults to `None`.
+            output_only_surf_vars (tuple[str, ...], optional): Surface-level variables that the
+                model predicts but that are not present in real input data. These will be
+                zero-padded in the input batch during rollout. Defaults to `()`.
+            output_only_atmos_vars (tuple[str, ...], optional): Atmospheric variables that the
+                model predicts but that are not present in real input data. These will be
+                zero-padded in the input batch during rollout. Defaults to `()`.
         """
         super().__init__()
         self.surf_vars = surf_vars
+        self.static_vars = static_vars
         self.atmos_vars = atmos_vars
         self.patch_size = patch_size
         self.surf_stats = surf_stats or dict()
@@ -187,6 +236,10 @@ class Aurora(torch.nn.Module):
         self.positive_surf_vars = positive_surf_vars
         self.positive_atmos_vars = positive_atmos_vars
         self.clamp_at_first_step = clamp_at_first_step
+        self.variable_lead_time = variable_lead_time
+        self.rollout_input_clipping = rollout_input_clipping
+        self.output_only_surf_vars = output_only_surf_vars
+        self.output_only_atmos_vars = output_only_atmos_vars
 
         if self.normalise:
             # note that British English is used throughout the repo so we are being consistent
@@ -231,6 +284,7 @@ class Aurora(torch.nn.Module):
             dynamic_vars=dynamic_vars,
             atmos_static_vars=atmos_static_vars,
             simulate_indexing_bug=simulate_indexing_bug,
+            use_updated_lead_time_embedding=use_updated_lead_time_embedding,
         )
 
         self.backbone = Swin3DTransformerBackbone(
@@ -242,10 +296,13 @@ class Aurora(torch.nn.Module):
             embed_dim=embed_dim,
             mlp_ratio=mlp_ratio,
             drop_path_rate=drop_path,
+            attn_drop_rate=drop_rate,
             drop_rate=drop_rate,
             use_lora=use_lora,
             lora_steps=lora_steps,
             lora_mode=lora_mode,
+            stochastic=stochastic,
+            use_updated_lead_time_embedding=use_updated_lead_time_embedding,
         )
 
         self.decoder = Perceiver3DDecoder(
@@ -263,35 +320,54 @@ class Aurora(torch.nn.Module):
             perceiver_ln_eps=perceiver_ln_eps,
             level_condition=level_condition,
             separate_perceiver=separate_perceiver,
-            modulation_head=modulation_head,
+            modulation_heads=modulation_heads,
         )
 
-        if autocast and not bf16_mode:
+        if bf16_mode and not autocast:
             warnings.warn(
-                "The argument `autocast` no longer does anything due to limited utility. "
-                "Consider instead using `bf16_mode`.",
+                "`bf16_mode` was removed, because it caused serious issues for gradient "
+                "computation. `bf16_mode` now automatically activates `autocast`, which will not "
+                "save as much memory, but should be much more stable.",
                 stacklevel=2,
             )
+            autocast = True
 
-        self.bf16_mode = bf16_mode
+        self.autocast = autocast
+        self.autocast_dtype = autocast_dtype
+        self.autocast_encoder = False
+        self.autocast_backbone = autocast
+        self.autocast_decoder = False
 
-        if self.bf16_mode:
-            # We run the backbone in pure BF16.
-            self.backbone.to(torch.bfloat16)
+        # Enable fp16-safe attention on all attention modules.
+        if use_fp16_safe_attention:
+            for m in self.modules():
+                if isinstance(m, (WindowAttention, PerceiverAttention)):
+                    m.use_fp16_safe_attention = True
 
-    @overload
-    def forward(self, batch: Batch, return_latent: Literal[False] = False) -> Batch: ...
+    def reset_noise(self) -> None:
+        """Flush the backbone noise cache.
 
-    @overload
-    def forward(self, batch: Batch, return_latent: Literal[True]) -> tuple[Batch, torch.Tensor]: ...
+        See :meth:`Swin3DTransformerBackbone.reset_noise`."""
+        self.backbone.reset_noise()
 
-    def forward(
-        self, batch: Batch, return_latent: bool = False
-    ) -> Batch | tuple[Batch, torch.Tensor]:
+    def set_noise_accumulation(self, n: int = 0) -> None:
+        """Enable or disable noise caching in the backbone.
+
+        See :meth:`Swin3DTransformerBackbone.set_noise_accumulation`.
+
+        Args:
+            n (int): Number of steps for noise accumulation. Disables accumulation if `n=0`.
+        """
+        self.backbone.set_noise_accumulation(n)
+
+    def forward(self, batch: Batch, lead_times: Optional[torch.Tensor] = None) -> Batch:
         """Forward pass.
 
         Args:
-            batch (:class:`Batch`): Batch to run the model on.
+            batch (:class:`aurora.Batch`): Batch to run the model on.
+            lead_times (:class:`torch.Tensor`, optional): Per-sample lead times of shape
+                `(batch,)` in hours. Required when the model was configured with
+                `variable_lead_time=True`. Ignored otherwise.
 
         Returns:
             :class:`Batch`: Prediction for the batch.
@@ -301,10 +377,9 @@ class Aurora(torch.nn.Module):
         # Get the first parameter. We'll derive the data type and device from this parameter.
         p = next(self.parameters())
         batch = batch.type(p.dtype)
-
+        batch = self._pre_norm_hook(batch)
         if self.normalise:
             batch = batch.normalise(surf_stats=self.surf_stats)
-
         batch = batch.crop(patch_size=self.patch_size)
         batch = batch.to(p.device)
 
@@ -346,42 +421,47 @@ class Aurora(torch.nn.Module):
 
         transformed_batch = self._pre_encoder_hook(transformed_batch)
 
-        # The encoder is always just run.
-        x = self.encoder(
-            transformed_batch,
-            lead_time=self.timestep,
-        )
-
-        # In BF16 mode, the backbone is run in pure BF16.
-        if self.bf16_mode:
-            x = x.to(torch.bfloat16)
-        x = self.backbone(
-            x,
-            lead_time=self.timestep,
-            patch_res=patch_res,
-            rollout_step=batch.metadata.rollout_step,
-        )
-
-        # In BF16 mode, the decoder is run in AMP PF16, and the output is converted back to FP32.
-        # We run in PF16 as opposed to BF16 for improved relative precision.
-        if self.bf16_mode:
-            context = torch.autocast(device_type="cuda", dtype=torch.float16)
-            x = x.to(torch.float16)
+        # Resolve lead times to a tensor of shape (B,) in hours.
+        if self.variable_lead_time:
+            if lead_times is None:
+                raise ValueError(
+                    "`variable_lead_time=True` but `lead_times` is `None`. "
+                    "Please provide a `lead_times` tensor of shape `(batch,)` in hours."
+                )
+            lead_times = lead_times.to(device=p.device, dtype=p.dtype)
         else:
-            context = contextlib.nullcontext()
-        with context:
+            lead_hours = self.timestep.total_seconds() / 3600
+            lead_times = torch.full((B,), lead_hours, device=p.device, dtype=p.dtype)
+
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        elif torch.xpu.is_available():
+            device_type = "xpu"
+        else:
+            device_type = "cpu"
+        autocast = torch.autocast(device_type=device_type, dtype=self.autocast_dtype)
+        context_encoder = autocast if self.autocast_encoder else contextlib.nullcontext()
+        context_backbone = autocast if self.autocast_backbone else contextlib.nullcontext()
+        context_decoder = autocast if self.autocast_decoder else contextlib.nullcontext()
+
+        with context_encoder:
+            x = self.encoder(
+                transformed_batch,
+                lead_times=lead_times,
+            )
+        with context_backbone:
+            x = self.backbone(
+                x,
+                lead_times=lead_times,
+                patch_res=patch_res,
+                rollout_step=batch.metadata.rollout_step,
+            )
+        with context_decoder:
             pred = self.decoder(
                 x,
                 batch,
-                lead_time=self.timestep,
+                lead_times=lead_times,
                 patch_res=patch_res,
-            )
-        if self.bf16_mode:
-            pred = dataclasses.replace(
-                pred,
-                surf_vars={k: v.float() for k, v in pred.surf_vars.items()},
-                static_vars={k: v.float() for k, v in pred.static_vars.items()},
-                atmos_vars={k: v.float() for k, v in pred.atmos_vars.items()},
             )
 
         # Remove batch and history dimension from static variables.
@@ -422,11 +502,12 @@ class Aurora(torch.nn.Module):
                 },
             )
 
+        # Cast to float32 before unnormalising to avoid overflow.
+        pred = pred.type(torch.float32)
         if self.normalise:
             pred = pred.unnormalise(surf_stats=self.surf_stats)
 
-        if return_latent:
-            return pred, x  # pred, latent
+        pred = self._post_unnorm_hook(batch, pred)
 
         return pred
 
@@ -441,14 +522,66 @@ class Aurora(torch.nn.Module):
         """Transform the batch before it goes through the encoder."""
         return batch
 
+    def _pre_norm_hook(self, batch: Batch) -> Batch:
+        """Transform the batch before normalisation.
+
+        This is called automatically in :meth:`forward` right before :meth:`Batch.normalise`. Unlike
+        :meth:`batch_transform_hook`, this hook is *not* called separately in rollout, so
+        non-idempotent transforms (e.g. log-scaling) belong here.
+        """
+        return batch
+
     def _post_decoder_hook(self, batch: Batch, pred: Batch) -> Batch:
         """Transform the prediction right after the decoder."""
         return pred
+
+    def _post_unnorm_hook(self, batch: Batch, pred: Batch) -> Batch:
+        """Transform the prediction after un-normalisation, in physical space.
+
+        Subclasses can override this to apply post-processing that must operate on un-normalised
+        (physical) values, such as inverse log-scaling or recomputing prescribed channels.
+        """
+        return pred
+
+    def apply_rollout_input_clipping(self, pred: Batch) -> Batch:
+        """Clamp specified variables according to `rollout_input_clipping`.
+
+        This is intended to be called during autoregressive rollout *before* feeding a prediction
+        back as input, so that the unclipped prediction remains available for loss computation
+        during training. To minimize any other changes to the data flow from models prior to V1p5,
+        this is not called automatically in :meth:`forward`.
+        """
+        if not self.rollout_input_clipping:
+            return pred
+
+        clipped_surf = dict(pred.surf_vars)
+        clipped_atmos = dict(pred.atmos_vars)
+
+        for var_name, bounds in self.rollout_input_clipping.items():
+            lo = bounds.get("min")
+            hi = bounds.get("max")
+            if var_name in clipped_surf:
+                v = clipped_surf[var_name]
+                if lo is not None:
+                    v = v.clamp(min=lo)
+                if hi is not None:
+                    v = v.clamp(max=hi)
+                clipped_surf[var_name] = v
+            if var_name in clipped_atmos:
+                v = clipped_atmos[var_name]
+                if lo is not None:
+                    v = v.clamp(min=lo)
+                if hi is not None:
+                    v = v.clamp(max=hi)
+                clipped_atmos[var_name] = v
+
+        return dataclasses.replace(pred, surf_vars=clipped_surf, atmos_vars=clipped_atmos)
 
     def load_checkpoint(
         self,
         repo: Optional[str] = None,
         name: Optional[str] = None,
+        revision: Optional[str] = None,
         strict: bool = True,
     ) -> None:
         """Load a checkpoint from HuggingFace.
@@ -457,12 +590,14 @@ class Aurora(torch.nn.Module):
             repo (str, optional): Name of the repository of the form `user/repo`.
             name (str, optional): Path to the checkpoint relative to the root of the repository,
                 e.g. `checkpoint.cpkt`.
+            revision (str, optional): Version hash of the Huggingface git repository commit.
             strict (bool, optional): Error if the model parameters are not exactly equal to the
                 parameters in the checkpoint. Defaults to `True`.
         """
         repo = repo or self.default_checkpoint_repo
         name = name or self.default_checkpoint_name
-        path = hf_hub_download(repo_id=repo, filename=name)
+        revision = revision or self.default_checkpoint_revision
+        path = hf_hub_download(repo_id=repo, filename=name, revision=revision)
         self.load_checkpoint_local(path, strict=strict)
 
     def load_checkpoint_local(self, path: str, strict: bool = True) -> None:
@@ -508,7 +643,7 @@ class Aurora(torch.nn.Module):
 
         If a checkpoint was trained with a larger `max_history_size` than the current model,
         this function will assert fail to prevent loading the checkpoint. This is to
-        prevent loading a checkpoint which will likely cause the checkpoint to degrade is
+        prevent loading a checkpoint which will likely cause the checkpoint to degrade its
         performance.
 
         This implementation copies weights from the checkpoint to the model and fills zeros
@@ -539,32 +674,55 @@ class Aurora(torch.nn.Module):
 
                 checkpoint[name] = new_weight
 
-    def configure_activation_checkpointing(self):
+    def configure_activation_checkpointing(
+        self,
+        module_names: tuple[str, ...] = (
+            "Basic3DDecoderLayer",
+            "Basic3DEncoderLayer",
+            "LinearPatchReconstruction",
+            "Perceiver3DDecoder",
+            "Perceiver3DEncoder",
+            "Swin3DTransformerBackbone",
+            "Swin3DTransformerBlock",
+        ),
+    ) -> None:
         """Configure activation checkpointing.
 
         This is required in order to compute gradients without running out of memory.
+
+        Args:
+            module_names (tuple[str, ...], optional): Names of the modules to checkpoint
+                on.
+
+        Raises:
+            RuntimeError: If any module specifies in `module_names` was not found and
+                thus could not be checkpointed.
         """
-        # Checkpoint these modules:
-        module_names = (
-            "Perceiver3DEncoder",
-            "Swin3DTransformerBackbone",
-            "Basic3DEncoderLayer",
-            "Basic3DDecoderLayer",
-            "Perceiver3DDecoder",
-            "LinearPatchReconstruction",
-        )
+
+        found: set[str] = set()
 
         def check(x: torch.nn.Module) -> bool:
             name = x.__class__.__name__
-            return name in module_names
+            if name in module_names:
+                found.add(name)
+                return True
+            else:
+                return False
 
         apply_activation_checkpointing(self, check_fn=check)
+
+        if found != set(module_names):
+            raise RuntimeError(
+                f"Could not checkpoint on the following modules: "
+                f"{', '.join(sorted(set(module_names) - found))}."
+            )
 
 
 class AuroraPretrained(Aurora):
     """Pretrained version of Aurora."""
 
     default_checkpoint_name = "aurora-0.25-pretrained.ckpt"
+    default_checkpoint_revision = "0be7e57c685dac86b78c4a19a3ab149d13c6a3dd"
 
     def __init__(
         self,
@@ -585,6 +743,7 @@ class AuroraSmallPretrained(Aurora):
     """
 
     default_checkpoint_name = "aurora-0.25-small-pretrained.ckpt"
+    default_checkpoint_revision = "0be7e57c685dac86b78c4a19a3ab149d13c6a3dd"
 
     def __init__(
         self,
@@ -617,6 +776,7 @@ class Aurora12hPretrained(Aurora):
     """Pretrained version of Aurora with time step 12 hours."""
 
     default_checkpoint_name = "aurora-0.25-12h-pretrained.ckpt"
+    default_checkpoint_revision = "15e76e47b65bf4b28fd2246b7b5b951d6e2443b9"
 
     def __init__(
         self,
@@ -636,6 +796,7 @@ class AuroraHighRes(Aurora):
     """High-resolution version of Aurora."""
 
     default_checkpoint_name = "aurora-0.1-finetuned.ckpt"
+    default_checkpoint_revision = "0be7e57c685dac86b78c4a19a3ab149d13c6a3dd"
 
     def __init__(
         self,
@@ -657,6 +818,7 @@ class AuroraAirPollution(Aurora):
     """Fine-tuned version of Aurora for air pollution."""
 
     default_checkpoint_name = "aurora-0.4-air-pollution.ckpt"
+    default_checkpoint_revision = "1764d5630a53d3d7a7d169ca335236fc343e4bfc"
 
     _predict_difference_history_dim_lookup = {
         "pm1": 0,
@@ -697,7 +859,7 @@ class AuroraAirPollution(Aurora):
         dynamic_vars: bool = True,
         atmos_static_vars: bool = True,
         separate_perceiver: tuple[str, ...] = ("co", "no", "no2", "go3", "so2"),
-        modulation_head: bool = True,
+        modulation_heads: tuple[str, ...] = tuple(_predict_difference_history_dim_lookup.keys()),
         positive_surf_vars: tuple[str, ...] = (
             ("pm1", "pm2p5", "pm10", "tcco", "tc_no", "tcno2", "gtco3", "tcso2")
         ),
@@ -715,7 +877,7 @@ class AuroraAirPollution(Aurora):
             dynamic_vars=dynamic_vars,
             atmos_static_vars=atmos_static_vars,
             separate_perceiver=separate_perceiver,
-            modulation_head=modulation_head,
+            modulation_heads=modulation_heads,
             positive_surf_vars=positive_surf_vars,
             positive_atmos_vars=positive_atmos_vars,
             simulate_indexing_bug=simulate_indexing_bug,
@@ -814,6 +976,7 @@ class AuroraWave(Aurora):
     """Version of Aurora fined-tuned to HRES-WAM ocean wave data."""
 
     default_checkpoint_name = "aurora-0.25-wave.ckpt"
+    default_checkpoint_revision = "74598e8c65d53a96077c08bb91acdfa5525340c9"
 
     def __init__(
         self,
@@ -938,3 +1101,177 @@ class AuroraWave(Aurora):
                 del pred.surf_vars[f"{name}_density"]
 
         return pred
+
+
+class AuroraV1p5(Aurora):
+    """Aurora 1.5 with expanded surface variables, variable lead-time support, and insolation.
+
+    This variant was trained with an extended set of surface variables (26 total), additional static
+    fields, and prescribed solar insolation as an input channel. It supports variable lead-time
+    embeddings, enabling sub-6-hour prediction steps. Seven surface variables are output-only (not
+    present in the real input data) and are zero-padded during autoregressive rollout.
+    """
+
+    default_checkpoint_name = "aurora-0.25-v1.5.ckpt"
+    default_checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
+
+    def __init__(
+        self,
+        *,
+        surf_vars: tuple[str, ...] = (
+            ("2t", "10u", "10v", "msl", "2d", "tcwv", "tcc", "100u", "100v", "sp", "lcc", "mcc")
+            + ("hcc", "skt", "stl1", "swvl1", "ci", "scaled_sd", "i10fg", "blh", "uvb_1h")
+            + ("ssrd_1h", "ttr_1h", "scaled_tp_1h", "scaled_sf_1h", "insolation")
+        ),
+        static_vars: tuple[str, ...] = (
+            ("lsm", "z", "anor", "isor", "cvh", "cl", "dl", "cvl", "slor", "slt_0", "slt_1")
+            + ("slt_2", "slt_3", "slt_4", "slt_5", "slt_6", "slt_7", "sdfor", "sdor", "tvh_0")
+            + ("tvh_18", "tvh_19", "tvh_3", "tvh_4", "tvh_5", "tvh_6", "tvl_0", "tvl_1", "tvl_10")
+            + ("tvl_11", "tvl_13", "tvl_16", "tvl_17", "tvl_2", "tvl_7", "tvl_9")
+        ),
+        atmos_vars: tuple[str, ...] = ("z", "u", "v", "t", "q"),
+        output_only_surf_vars: tuple[str, ...] = (
+            ("i10fg", "blh", "uvb_1h", "ssrd_1h", "ttr_1h", "scaled_tp_1h", "scaled_sf_1h")
+        ),
+        rollout_input_clipping: Optional[dict[str, dict[str, Optional[float]]]] = None,
+        variable_lead_time: bool = True,
+        use_updated_lead_time_embedding: bool = True,
+        use_lora: bool = False,
+        use_fp16_safe_attention: bool = True,
+        autocast: bool = True,
+        autocast_dtype: torch.dtype = torch.float16,
+        **kw_args,
+    ) -> None:
+        # Define default clipping ranges for rollout inputs, which can be overridden by passing in
+        # `rollout_input_clipping`.
+        rollout_input_clipping = rollout_input_clipping or {}
+        if "tcwv" not in rollout_input_clipping:
+            rollout_input_clipping["tcwv"] = {"min": 0.0, "max": None}
+        if "tcc" not in rollout_input_clipping:
+            rollout_input_clipping["tcc"] = {"min": 0.0, "max": 1.0}
+        if "lcc" not in rollout_input_clipping:
+            rollout_input_clipping["lcc"] = {"min": 0.0, "max": 1.0}
+        if "mcc" not in rollout_input_clipping:
+            rollout_input_clipping["mcc"] = {"min": 0.0, "max": 1.0}
+        if "hcc" not in rollout_input_clipping:
+            rollout_input_clipping["hcc"] = {"min": 0.0, "max": 1.0}
+        if "swvl1" not in rollout_input_clipping:
+            rollout_input_clipping["swvl1"] = {"min": 0.0, "max": 70.0}
+        if "ci" not in rollout_input_clipping:
+            rollout_input_clipping["ci"] = {"min": 0.0, "max": 1.0}
+        if "scaled_sd" not in rollout_input_clipping:
+            rollout_input_clipping["scaled_sd"] = {"min": 0.0, "max": 10.0}
+
+        super().__init__(
+            surf_vars=surf_vars,
+            static_vars=static_vars,
+            atmos_vars=atmos_vars,
+            output_only_surf_vars=output_only_surf_vars,
+            rollout_input_clipping=rollout_input_clipping,
+            variable_lead_time=variable_lead_time,
+            use_updated_lead_time_embedding=use_updated_lead_time_embedding,
+            use_lora=use_lora,
+            use_fp16_safe_attention=use_fp16_safe_attention,
+            autocast=autocast,
+            autocast_dtype=autocast_dtype,
+            **kw_args,
+        )
+        self.autocast_encoder = autocast
+        self.autocast_backbone = autocast
+        self.autocast_decoder = autocast
+
+        # Variable naming scheme assumes that all log-transformed variables start with "scaled_".
+        self.log_transformed_surf_vars = tuple(v for v in self.surf_vars if v.startswith("scaled_"))
+
+    def _pre_encoder_hook(self, batch: Batch) -> Batch:
+        """Zero-pad output-only variables.
+
+        Output-only variables are predicted by the model but are not present in real input data.
+        They are added as zero tensors so the encoder receives the correct number of channels.
+        Mutates `batch.surf_vars` / `batch.atmos_vars` in place so that both `batch` and
+        `transformed_batch` in the caller see the new keys. Zero tensors are added post-
+        normalization.
+        """
+        for var in self.output_only_surf_vars:
+            ref = next(iter(batch.surf_vars.values()))
+            batch.surf_vars[var] = torch.zeros_like(ref)
+        for var in self.output_only_atmos_vars:
+            ref = next(iter(batch.atmos_vars.values()))
+            batch.atmos_vars[var] = torch.zeros_like(ref)
+        return batch
+
+    def _pre_norm_hook(self, batch: Batch) -> Batch:
+        """Apply log-transform to scaled surface variables before normalisation."""
+        return dataclasses.replace(
+            batch,
+            surf_vars={
+                k: log_transform(v) if k in self.log_transformed_surf_vars else v
+                for k, v in batch.surf_vars.items()
+            },
+        )
+
+    def _post_unnorm_hook(self, batch: Batch, pred: Batch) -> Batch:
+        """Apply inverse log-transform and recompute prescribed insolation."""
+        pred = dataclasses.replace(
+            pred,
+            surf_vars={
+                k: log_untransform(v) if k in self.log_transformed_surf_vars else v
+                for k, v in pred.surf_vars.items()
+            },
+        )
+        pred = self._update_insolation(pred)
+        return pred
+
+    def _update_insolation(self, pred: Batch) -> Batch:
+        """Recompute prescribed insolation for the prediction's valid time."""
+        if "insolation" not in pred.surf_vars:
+            return pred
+
+        lat_np = pred.metadata.lat.cpu().numpy().astype(np.float32)
+        lon_np = pred.metadata.lon.cpu().numpy().astype(np.float32)
+
+        sol_all = []
+        for t in pred.metadata.time:
+            sol = insolation([t], lat_np, lon_np, enforce_2d=True)
+            sol_all.append(sol[0])  # Shape (H, W)
+        sol_tensor = torch.tensor(
+            np.stack(sol_all, axis=0),
+            dtype=pred.surf_vars["insolation"].dtype,
+            device=pred.surf_vars["insolation"].device,
+        )
+        # `pred.surf_vars["insolation"]` has shape (B, 1, H, W)
+        sol_tensor = sol_tensor[:, None, :, :]
+
+        return dataclasses.replace(
+            pred,
+            surf_vars={
+                k: (sol_tensor if k == "insolation" else v) for k, v in pred.surf_vars.items()
+            },
+        )
+
+    def _adapt_checkpoint(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return _adapt_checkpoint_v1p5(
+            self.patch_size,
+            self.surf_vars,
+            self.static_vars,
+            self.atmos_vars,
+            d,
+        )
+
+
+class AuroraV1p5Ensemble(AuroraV1p5):
+    """Aurora 1.5 ensemble version with stochastic noise injection."""
+
+    default_checkpoint_name = "aurora-0.25-v1.5-ensemble.ckpt"
+    default_checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
+
+    def __init__(
+        self,
+        *,
+        stochastic: bool = True,
+        **kw_args,
+    ) -> None:
+        super().__init__(
+            stochastic=stochastic,
+            **kw_args,
+        )

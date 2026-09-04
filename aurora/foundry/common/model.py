@@ -32,6 +32,9 @@ class Model(metaclass=abc.ABCMeta):
         if torch.cuda.is_available():
             logger.info("GPU detected. Running on GPU.")
             self.target_device = torch.device("cuda")
+        elif torch.xpu.is_available():
+            logger.info("XPU detected. Running on XPU.")
+            self.target_device = torch.device("xpu")
         else:
             logger.warning("No GPU available. Running on CPU.")
             self.target_device = torch.device("cpu")
@@ -134,6 +137,26 @@ class AuroraWave(Model):
 
     def create_model(self) -> aurora.Aurora:
         model = aurora.AuroraWave()
+        model.load_checkpoint_local(MLFLOW_ARTIFACTS[self.name])
+        return model
+
+
+class AuroraV1p5(Model):
+    name = "aurora-0.25-v1.5"
+    """str: Name of the model."""
+
+    def create_model(self) -> aurora.Aurora:
+        model = aurora.AuroraV1p5()
+        model.load_checkpoint_local(MLFLOW_ARTIFACTS[self.name])
+        return model
+
+
+class AuroraV1p5Ensemble(Model):
+    name = "aurora-0.25-v1.5-ensemble"
+    """str: Name of the model."""
+
+    def create_model(self) -> aurora.Aurora:
+        model = aurora.AuroraV1p5Ensemble()
         model.load_checkpoint_local(MLFLOW_ARTIFACTS[self.name])
         return model
 

@@ -57,7 +57,7 @@ dev = [
     "mypy",
     "ruff==0.4.1",
     "pre-commit",
-    "jupyter-book",
+    "jupyter-book<2",
     "mlflow",
 ]
 

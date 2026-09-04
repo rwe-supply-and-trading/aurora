@@ -156,7 +156,7 @@ class Tracker:
         """Track the next step.
 
         Args:
-            batch (:class:`aurora.batch.Batch`): Prediction.
+            batch (:class:`aurora.Batch`): Prediction.
         """
         # Check that there is only one prediction. We don't support batched tracking.
         if len(batch.metadata.time) != 1:

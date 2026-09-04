@@ -42,3 +42,26 @@ Models
 
 .. autoclass:: aurora.AuroraWave
     :members:
+
+.. autoclass:: aurora.AuroraV1p5
+    :members:
+
+.. autoclass:: aurora.AuroraV1p5Ensemble
+    :members:
+
+Latent Vectors
+--------------
+.. note::
+    This section documents a feature of the RWE Supply & Trading fork.
+
+.. autoclass:: aurora.latent.LatentCapture
+    :special-members: __init__
+    :members:
+
+.. autofunction:: aurora.latent.capture_latents
+
+.. autofunction:: aurora.latent.rollout_with_latents
+
+.. autofunction:: aurora.latent.latents_to_grid
+
+.. autofunction:: aurora.latent.patch_res_for

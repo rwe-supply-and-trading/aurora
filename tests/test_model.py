@@ -1,7 +1,9 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
 
+import dataclasses
 import os
 from datetime import timedelta
+from typing import cast
 
 import numpy as np
 import pytest
@@ -24,6 +26,18 @@ def aurora_small() -> Aurora:
 
 def test_aurora_small(aurora_small: Aurora, test_input_output: tuple[Batch, SavedBatch]) -> None:
     batch, test_output = test_input_output
+
+    # Run the test with batch size two.
+    batch = dataclasses.replace(
+        batch,
+        surf_vars={k: v.repeat(2, 1, 1, 1) for k, v in batch.surf_vars.items()},
+        atmos_vars={k: v.repeat(2, 1, 1, 1, 1) for k, v in batch.atmos_vars.items()},
+    )
+    test_output = cast(SavedBatch, dict(test_output))  #  Copy before mutating.
+    test_output["surf_vars"] = {k: v.repeat(2, axis=0) for k, v in test_output["surf_vars"].items()}
+    test_output["atmos_vars"] = {
+        k: v.repeat(2, axis=0) for k, v in test_output["atmos_vars"].items()
+    }
 
     with torch.inference_mode():
         pred = aurora_small.forward(batch)
@@ -57,7 +71,7 @@ def test_aurora_small(aurora_small: Aurora, test_input_output: tuple[Batch, Save
         assert_approx_equality(
             pred.static_vars[k].numpy(),
             batch.static_vars[k].numpy(),
-            1e-10,  # These should be exactly equal.
+            1e-7,  # Tolerance for double to float conversion in normalisation back and forth
         )
     for k in pred.atmos_vars:
         assert_approx_equality(
@@ -72,6 +86,13 @@ def test_aurora_small(aurora_small: Aurora, test_input_output: tuple[Batch, Save
     assert pred.metadata.time == tuple(test_output["metadata"]["time"])
 
 
+@pytest.mark.skipif(
+    os.name == "nt",  # Checks if we're running on Windows.
+    reason=(
+        "DDP test suddenly started failing with error "
+        "`RuntimeError: makeDeviceForHostname(): unsupported gloo device` on Windows."
+    ),
+)
 def test_aurora_small_ddp(
     aurora_small: Aurora, test_input_output: tuple[Batch, SavedBatch]
 ) -> None:

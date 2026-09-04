@@ -11,7 +11,8 @@ import xarray as xr
 
 from aurora import AuroraPretrained
 from aurora.data import ERA5DataLoaderFOAM
-from aurora.rollout import rollout, rollout_with_latents
+from aurora.latent import rollout_with_latents
+from aurora.rollout import rollout
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 

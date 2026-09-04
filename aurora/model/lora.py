@@ -21,7 +21,7 @@ class LoRA(nn.Module):
         r: int = 4,
         alpha: int = 1,
         dropout: float = 0.0,
-    ):
+    ) -> None:
         """Initialise.
 
         Args:
@@ -75,7 +75,7 @@ class LoRARollout(nn.Module):
         dropout: float = 0.0,
         max_steps: int = 40,
         mode: LoRAMode = "single",
-    ):
+    ) -> None:
         """Initialise.
 
         Args:
