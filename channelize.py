@@ -1,6 +1,6 @@
 #!/usr/bin/env python
+"""Copyright (c) RWE Supply & Trading GmbH. Licensed under the MIT license.
 
-"""
 conda activate aurora
 
 # Initialize the destination zarr v3 store

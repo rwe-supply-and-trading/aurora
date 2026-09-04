@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+"""Copyright (c) RWE Supply & Trading GmbH. Licensed under the MIT license."""
 
 import datetime
 import os

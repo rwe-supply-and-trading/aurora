@@ -1,4 +1,7 @@
-"""Utilities to manage read/write of data using arraylake/icechunk/zarr."""
+"""Copyright (c) RWE Supply & Trading GmbH. Licensed under the MIT license.
+
+Utilities to manage read/write of data using arraylake/icechunk/zarr.
+"""
 
 import logging
 from datetime import datetime, timedelta

@@ -1,4 +1,7 @@
-"""Utilities for working with Zarr data using the obstore backend."""
+"""Copyright (c) RWE Supply & Trading GmbH. Licensed under the MIT license.
+
+Utilities for working with Zarr data using the obstore backend.
+"""
 
 import logging
 

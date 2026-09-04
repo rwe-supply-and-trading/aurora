@@ -1,3 +1,5 @@
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
+
 try:
     import kafou_arraylake as arraylake
 except ImportError:

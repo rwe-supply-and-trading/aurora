@@ -1,3 +1,5 @@
+"""Copyright (c) RWE Supply & Trading GmbH. Licensed under the MIT license."""
+
 import logging
 
 import numpy as np
