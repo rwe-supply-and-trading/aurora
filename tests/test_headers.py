@@ -34,7 +34,7 @@ for path in _root.rglob("**/*.py"):
 
 @pytest.mark.parametrize("python_file", PYTHON_FILES)
 def test_presence_of_copyright_header(python_file: Path) -> None:
-    with open(python_file) as f:
+    with open(python_file, encoding="utf-8") as f:
         lines = list(f.read().splitlines())
 
     # An executable script may lead with a shebang, which must stay on the first line.
