@@ -148,7 +148,8 @@ def init(
         - location: S3 path to Zarr store (e.g. "s3://my-bucket/forecast.zarr")
         - start: Start of initialization time range (e.g. "2024-01-01T00:00")
         - end: End of initialization time range (e.g. "2024-01-31T18:00")
-        - rollout_steps: Number of forecast steps to initialize (e.g. 72 for 3 days at 1 step per hour)
+        - rollout_steps: Number of forecast steps to initialize
+          (e.g. 72 for 3 days at 1 step per hour)
         - lat_range: Optional latitude range for spatial subset (e.g. --lat-range -30 30)
         - lon_range: Optional longitude range for spatial subset (e.g. --lon-range -60 60)
 

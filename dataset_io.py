@@ -7,10 +7,6 @@ import logging
 from datetime import datetime, timedelta
 from typing import Literal, Union
 
-try:
-    import kafou_arraylake as arraylake
-except ImportError:
-    pass
 import cftime
 import numpy as np
 import pandas as pd

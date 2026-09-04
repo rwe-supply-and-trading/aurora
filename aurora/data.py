@@ -1,9 +1,9 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
 
-try:
+import contextlib
+
+with contextlib.suppress(ImportError):
     import kafou_arraylake as arraylake
-except ImportError:
-    pass
 
 import datetime
 
@@ -20,7 +20,8 @@ class ERA5DataLoaderFOAM:
     """
     An ERA5 data loader.
 
-    Goes with resample_era5.py which reorganizes ERA5 data into a scheme which is fast to load from an object
+    Goes with resample_era5.py which reorganizes ERA5 data into a scheme which is
+    fast to load from an object
     store for the FOAM use-case.
 
     Example use:
@@ -37,9 +38,15 @@ class ERA5DataLoaderFOAM:
         session = repo.readonly_session("main")
 
         # Load invariant and sample data for 2009-2024.
-        invariant_data = xr.open_zarr(session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None)
-        sample_data = xr.open_zarr(session.store, group="samples", zarr_format=3, consolidated=False, chunks=None)
-        sample_data = sample_data.sel(time=slice(datetime(2009, 1, 1, 0), datetime(2024, 12, 31, 18)))
+        invariant_data = xr.open_zarr(
+            session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
+        )
+        sample_data = xr.open_zarr(
+            session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
+        )
+        sample_data = sample_data.sel(
+            time=slice(datetime(2009, 1, 1, 0), datetime(2024, 12, 31, 18))
+        )
 
         # Create a data loader.
         loader = ERA5DataLoaderFOAM(sample_data, invariant_data)
@@ -101,7 +108,7 @@ class ERA5DataLoaderFOAM:
         pl_locs = ds.attrs["var_locs"]["pl"]
 
         surf_vars = {}
-        for varname, (idx, n_channels) in sfc_locs.items():
+        for varname, (idx, _n_channels) in sfc_locs.items():
             ary = ds["sample_data"][:, :, idx].to_numpy()
             surf_vars[varname] = torch.from_numpy(ary)
 
@@ -218,7 +225,8 @@ class ECMWFDataLoaderFOAM:
     """
     An ECMWF data loader.
 
-    Goes with resample_ECMWF.py which reorganizes ECMWF data into a scheme which is fast to load from an object
+    Goes with resample_ECMWF.py which reorganizes ECMWF data into a scheme which is
+    fast to load from an object
     store for the FOAM use-case.
 
     Example use:
@@ -235,9 +243,15 @@ class ECMWFDataLoaderFOAM:
         session = repo.readonly_session("main")
 
         # Load invariant and sample data for 2009-2024.
-        invariant_data = xr.open_zarr(session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None)
-        sample_data = xr.open_zarr(session.store, group="samples", zarr_format=3, consolidated=False, chunks=None)
-        sample_data = sample_data.sel(time=slice(datetime(2009, 1, 1, 0), datetime(2024, 12, 31, 18)))
+        invariant_data = xr.open_zarr(
+            session.store, group="invariant", zarr_format=3, consolidated=False, chunks=None
+        )
+        sample_data = xr.open_zarr(
+            session.store, group="samples", zarr_format=3, consolidated=False, chunks=None
+        )
+        sample_data = sample_data.sel(
+            time=slice(datetime(2009, 1, 1, 0), datetime(2024, 12, 31, 18))
+        )
 
         # Create a data loader.
         loader = ECMWFDataLoaderFOAM(sample_data, invariant_data)
@@ -299,7 +313,7 @@ class ECMWFDataLoaderFOAM:
         pl_locs = ds.attrs["var_locs"]["pl"]
 
         surf_vars = {}
-        for varname, (idx, n_channels) in sfc_locs.items():
+        for varname, (idx, _n_channels) in sfc_locs.items():
             ary = ds["sample_data"][:, :, idx].to_numpy()
             surf_vars[varname] = torch.from_numpy(ary)
 

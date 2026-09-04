@@ -127,7 +127,8 @@ def initialize_dataset(
     # Else just return the whole latent grid
     else:
         logger.info(
-            "[INIT] Not subsetting coordinates, using full grid with lat=[-89.75, 90], lon=[-180, 179.75]"
+            "[INIT] Not subsetting coordinates, using full grid with "
+            "lat=[-89.75, 90], lon=[-180, 179.75]"
         )
         spatial_coord = np.arange(259200, dtype="int64")
         n_spatial = 259200
@@ -200,8 +201,10 @@ def run_worker(*, start_time: str, end_time: str, store_path: str, src: str) -> 
     """Worker function to generate forecasts for a given time range and store in Zarr.
 
     Args:
-        - start_time (str): Start of the time range (inclusive) in ISO format, e.g. "2024-01-01T00:00:00Z"
-        - end_time (str): End of the time range (inclusive) in ISO format, e.g. "2024-01-31T18:00:00Z"
+        - start_time (str): Start of the time range (inclusive) in ISO format,
+          e.g. "2024-01-01T00:00:00Z"
+        - end_time (str): End of the time range (inclusive) in ISO format,
+          e.g. "2024-01-31T18:00:00Z"
         - store_path (str): S3 path to the Zarr store, e.g. "s3://my-bucket/forecast.zarr"
         - src (str): Source dataset to use for forecasts, either "ecmwf" or "era5"
     Returns:
@@ -218,7 +221,8 @@ def run_worker(*, start_time: str, end_time: str, store_path: str, src: str) -> 
     init_times = ds_store.init_time.sel(init_time=slice(start_time, end_time)).values
 
     logger.info(
-        f"[WORKER] Store spatial_indices: [{spatial_indices[0:3]} ... {spatial_indices[-3:]}], len={len(spatial_indices)}"
+        f"[WORKER] Store spatial_indices: [{spatial_indices[0:3]} ... "
+        f"{spatial_indices[-3:]}], len={len(spatial_indices)}"
     )
 
     # Instantiate LV Extractors
