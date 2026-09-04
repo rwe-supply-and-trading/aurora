@@ -4,7 +4,7 @@ import contextlib
 import dataclasses
 import warnings
 from datetime import timedelta
-from typing import Optional
+from typing import Literal, Optional, overload
 
 import numpy as np
 import torch
@@ -23,7 +23,7 @@ from aurora.model.compat import (
 from aurora.model.decoder import Perceiver3DDecoder
 from aurora.model.encoder import Perceiver3DEncoder
 from aurora.model.lora import LoRAMode
-from aurora.model.swin3d import BasicLayer3D, Swin3DTransformerBackbone
+from aurora.model.swin3d import Swin3DTransformerBackbone
 
 __all__ = [
     "Aurora",
@@ -80,6 +80,7 @@ class Aurora(torch.nn.Module):
         surf_stats: Optional[dict[str, tuple[float, float]]] = None,
         normalise: bool = True,
         autocast: bool = False,
+        bf16_mode: bool = False,
         level_condition: Optional[tuple[int | float, ...]] = None,
         dynamic_vars: bool = False,
         atmos_static_vars: bool = False,
@@ -87,6 +88,7 @@ class Aurora(torch.nn.Module):
         modulation_head: bool = False,
         positive_surf_vars: tuple[str, ...] = (),
         positive_atmos_vars: tuple[str, ...] = (),
+        clamp_at_first_step: bool = False,
         simulate_indexing_bug: bool = False,
     ) -> None:
         """Construct an instance of the model.
@@ -141,8 +143,10 @@ class Aurora(torch.nn.Module):
             surf_stats (dict[str, tuple[float, float]], optional): For these surface-level
                 variables, adjust the normalisation to the given tuple consisting of a new location
                 and scale.
-            autocast (bool, optional): Use `torch.autocast` to reduce memory usage. Defaults to
-                `False`.
+            bf16_mode (bool, optional): To reduce memory usage, convert the tokens to BF16, run
+                the backbone in pure BF16, and run the decoder in FP16 AMP. This should enable a
+                gradient computation. USE AT YOUR OWN RISK. THIS WAS NOT USED DURING THE DEVELOPMENT
+                OF AURORA AND IS PURELY PROVIDED AS A STARTING POINT FOR FINE-TUNING.
             level_condition (tuple[int | float, ...], optional): Make the patch embeddings dependent
                 on pressure level. If you want to enable this feature, provide a tuple of all
                 possible pressure levels.
@@ -165,6 +169,8 @@ class Aurora(torch.nn.Module):
                 positive. Clamp them before running them through the encoder, and also clamp them
                 when autoregressively rolling out the model. The variables are not clamped for the
                 first roll-out step.
+            clamp_at_first_step (bool, optional): Clamp the positive variables for the first
+                roll-out step. Should only be used for inference. Defaults to `False`.
             simulate_indexing_bug (bool, optional): Simulate an indexing bug that's present for the
                 air pollution version of Aurora. This is necessary to obtain numerical equivalence
                 to the original implementation. Defaults to `False`.
@@ -174,13 +180,13 @@ class Aurora(torch.nn.Module):
         self.atmos_vars = atmos_vars
         self.patch_size = patch_size
         self.surf_stats = surf_stats or dict()
-        self.autocast = autocast
         self.max_history_size = max_history_size
         self.timestep = timestep
         self.normalise = normalise
         self.use_lora = use_lora
         self.positive_surf_vars = positive_surf_vars
         self.positive_atmos_vars = positive_atmos_vars
+        self.clamp_at_first_step = clamp_at_first_step
 
         if self.normalise:
             # note that British English is used throughout the repo so we are being consistent
@@ -260,7 +266,28 @@ class Aurora(torch.nn.Module):
             modulation_head=modulation_head,
         )
 
-    def forward(self, batch: Batch) -> Batch:
+        if autocast and not bf16_mode:
+            warnings.warn(
+                "The argument `autocast` no longer does anything due to limited utility. "
+                "Consider instead using `bf16_mode`.",
+                stacklevel=2,
+            )
+
+        self.bf16_mode = bf16_mode
+
+        if self.bf16_mode:
+            # We run the backbone in pure BF16.
+            self.backbone.to(torch.bfloat16)
+
+    @overload
+    def forward(self, batch: Batch, return_latent: Literal[False] = False) -> Batch: ...
+
+    @overload
+    def forward(self, batch: Batch, return_latent: Literal[True]) -> tuple[Batch, torch.Tensor]: ...
+
+    def forward(
+        self, batch: Batch, return_latent: bool = False
+    ) -> Batch | tuple[Batch, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -319,23 +346,43 @@ class Aurora(torch.nn.Module):
 
         transformed_batch = self._pre_encoder_hook(transformed_batch)
 
+        # The encoder is always just run.
         x = self.encoder(
             transformed_batch,
             lead_time=self.timestep,
         )
-        with torch.autocast(device_type="cuda") if self.autocast else contextlib.nullcontext():
-            x = self.backbone(
-                x,
-                lead_time=self.timestep,
-                patch_res=patch_res,
-                rollout_step=batch.metadata.rollout_step,
-            )
-        pred = self.decoder(
+
+        # In BF16 mode, the backbone is run in pure BF16.
+        if self.bf16_mode:
+            x = x.to(torch.bfloat16)
+        x = self.backbone(
             x,
-            batch,
             lead_time=self.timestep,
             patch_res=patch_res,
+            rollout_step=batch.metadata.rollout_step,
         )
+
+        # In BF16 mode, the decoder is run in AMP PF16, and the output is converted back to FP32.
+        # We run in PF16 as opposed to BF16 for improved relative precision.
+        if self.bf16_mode:
+            context = torch.autocast(device_type="cuda", dtype=torch.float16)
+            x = x.to(torch.float16)
+        else:
+            context = contextlib.nullcontext()
+        with context:
+            pred = self.decoder(
+                x,
+                batch,
+                lead_time=self.timestep,
+                patch_res=patch_res,
+            )
+        if self.bf16_mode:
+            pred = dataclasses.replace(
+                pred,
+                surf_vars={k: v.float() for k, v in pred.surf_vars.items()},
+                static_vars={k: v.float() for k, v in pred.static_vars.items()},
+                atmos_vars={k: v.float() for k, v in pred.atmos_vars.items()},
+            )
 
         # Remove batch and history dimension from static variables.
         pred = dataclasses.replace(
@@ -353,7 +400,12 @@ class Aurora(torch.nn.Module):
         pred = self._post_decoder_hook(batch, pred)
 
         # Clamp positive variables.
-        if self.positive_surf_vars and pred.metadata.rollout_step > 1:
+        clamp_at_rollout_step = (
+            pred.metadata.rollout_step >= 1
+            if self.clamp_at_first_step
+            else pred.metadata.rollout_step > 1
+        )
+        if self.positive_surf_vars and clamp_at_rollout_step:
             pred = dataclasses.replace(
                 pred,
                 surf_vars={
@@ -361,7 +413,7 @@ class Aurora(torch.nn.Module):
                     for k, v in pred.surf_vars.items()
                 },
             )
-        if self.positive_atmos_vars and pred.metadata.rollout_step > 1:
+        if self.positive_atmos_vars and clamp_at_rollout_step:
             pred = dataclasses.replace(
                 pred,
                 atmos_vars={
@@ -372,6 +424,9 @@ class Aurora(torch.nn.Module):
 
         if self.normalise:
             pred = pred.unnormalise(surf_stats=self.surf_stats)
+
+        if return_latent:
+            return pred, x  # pred, latent
 
         return pred
 
@@ -489,7 +544,21 @@ class Aurora(torch.nn.Module):
 
         This is required in order to compute gradients without running out of memory.
         """
-        apply_activation_checkpointing(self, check_fn=lambda x: isinstance(x, BasicLayer3D))
+        # Checkpoint these modules:
+        module_names = (
+            "Perceiver3DEncoder",
+            "Swin3DTransformerBackbone",
+            "Basic3DEncoderLayer",
+            "Basic3DDecoderLayer",
+            "Perceiver3DDecoder",
+            "LinearPatchReconstruction",
+        )
+
+        def check(x: torch.nn.Module) -> bool:
+            name = x.__class__.__name__
+            return name in module_names
+
+        apply_activation_checkpointing(self, check_fn=check)
 
 
 class AuroraPretrained(Aurora):
@@ -568,7 +637,7 @@ class AuroraHighRes(Aurora):
 
     default_checkpoint_name = "aurora-0.1-finetuned.ckpt"
 
-    def __init(
+    def __init__(
         self,
         *,
         patch_size: int = 10,
